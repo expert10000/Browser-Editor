@@ -12,6 +12,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -42,10 +43,29 @@ namespace WebView2WindowsFormsBrowser
         private Button _openHtmlButton;
         private Button _formatHtmlButton;
         private System.Windows.Forms.Timer _editorPreviewTimer;
+        private System.Windows.Forms.Timer _editorSyntaxTimer;
         private bool _suppressEditorTextChanged;
+        private bool _isApplyingSyntaxHighlight;
         private bool _isRenderingEditorPreview;
         private bool _syncEditorFromNavigation;
         private Uri _editorBaseUri;
+        private const int SyntaxHighlightMaxChars = 120000;
+        private const int SyntaxHighlightViewportPadding = 20000;
+        private const int ScriptFormatMaxChars = 80000;
+        private const int CssFormatMaxChars = 80000;
+        private static readonly Regex HtmlCommentPattern = new Regex("<!--[\\s\\S]*?-->", RegexOptions.Compiled);
+        private static readonly Regex HtmlDoctypePattern = new Regex("<!DOCTYPE[\\s\\S]*?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex HtmlEntityPattern = new Regex("&(?:#\\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);", RegexOptions.Compiled);
+        private static readonly Color EditorBaseColor = Color.FromArgb(232, 236, 244);
+        private static readonly Color EditorCommentColor = Color.FromArgb(120, 160, 120);
+        private static readonly Color EditorTagBracketColor = Color.FromArgb(148, 163, 184);
+        private static readonly Color EditorTagNameColor = Color.FromArgb(96, 165, 250);
+        private static readonly Color EditorAttributeNameColor = Color.FromArgb(244, 114, 182);
+        private static readonly Color EditorAttributeValueColor = Color.FromArgb(253, 186, 116);
+        private static readonly Color EditorEntityColor = Color.FromArgb(45, 212, 191);
+        private const int WM_SETREDRAW = 0x000B;
+        private const int EM_GETSCROLLPOS = 0x0400 + 221;
+        private const int EM_SETSCROLLPOS = 0x0400 + 222;
         public CoreWebView2CreationProperties CreationProperties
         {
             get
@@ -1604,17 +1624,29 @@ namespace WebView2WindowsFormsBrowser
 
         private void htmlEditor_TextChanged(object sender, EventArgs e)
         {
-            if (_suppressEditorTextChanged || _editorPreviewTimer == null)
+            if (_suppressEditorTextChanged || _isApplyingSyntaxHighlight || _editorPreviewTimer == null)
                 return;
 
             _editorPreviewTimer.Stop();
             _editorPreviewTimer.Start();
+
+            if (_editorSyntaxTimer != null)
+            {
+                _editorSyntaxTimer.Stop();
+                _editorSyntaxTimer.Start();
+            }
         }
 
         private async void editorPreviewTimer_Tick(object sender, EventArgs e)
         {
             _editorPreviewTimer.Stop();
             await RenderEditorToPreviewAsync();
+        }
+
+        private void editorSyntaxTimer_Tick(object sender, EventArgs e)
+        {
+            _editorSyntaxTimer.Stop();
+            ApplyHtmlSyntaxHighlight();
         }
 
         private async Task SyncEditorWithCurrentPageAsync()
@@ -1676,6 +1708,7 @@ namespace WebView2WindowsFormsBrowser
                 _htmlEditor.SelectionLength = 0;
             }
             _suppressEditorTextChanged = false;
+            ApplyHtmlSyntaxHighlight();
         }
 
         private static string FormatHtmlForEditor(string html)
@@ -1875,6 +1908,8 @@ namespace WebView2WindowsFormsBrowser
         {
             if (string.IsNullOrWhiteSpace(input))
                 return string.Empty;
+            if (input.Length > ScriptFormatMaxChars)
+                return NormalizeMultiline(input);
 
             var sb = new StringBuilder(input.Length + (input.Length / 3));
             int indent = 0;
@@ -2096,6 +2131,8 @@ namespace WebView2WindowsFormsBrowser
         {
             if (string.IsNullOrWhiteSpace(input))
                 return string.Empty;
+            if (input.Length > CssFormatMaxChars)
+                return NormalizeMultiline(input);
 
             var sb = new StringBuilder(input.Length + (input.Length / 3));
             int indent = 0;
@@ -2302,6 +2339,329 @@ namespace WebView2WindowsFormsBrowser
             return sb.ToString();
         }
 
+        private void ApplyHtmlSyntaxHighlight()
+        {
+            if (_htmlEditor == null || _isApplyingSyntaxHighlight)
+                return;
+
+            string text = _htmlEditor.Text ?? string.Empty;
+            if (text.Length == 0)
+                return;
+
+            _isApplyingSyntaxHighlight = true;
+            _suppressEditorTextChanged = true;
+            _htmlEditor.SuspendLayout();
+            try
+            {
+                int selectionStart = _htmlEditor.SelectionStart;
+                int selectionLength = _htmlEditor.SelectionLength;
+                var scrollPos = GetRichTextScrollPosition(_htmlEditor);
+                SuspendControlPainting(_htmlEditor);
+
+                int colorStart = 0;
+                int colorLength = text.Length;
+                if (text.Length > SyntaxHighlightMaxChars)
+                {
+                    int viewportStart = _htmlEditor.GetCharIndexFromPosition(new Point(1, 1));
+                    int viewportEnd = _htmlEditor.GetCharIndexFromPosition(new Point(
+                        Math.Max(1, _htmlEditor.ClientSize.Width - 4),
+                        Math.Max(1, _htmlEditor.ClientSize.Height - 4)));
+
+                    int focusStart = Math.Min(viewportStart, selectionStart);
+                    int focusEnd = Math.Max(viewportEnd, selectionStart + selectionLength);
+
+                    colorStart = Math.Max(0, focusStart - SyntaxHighlightViewportPadding);
+                    int colorEnd = Math.Min(text.Length, Math.Max(focusEnd, colorStart) + SyntaxHighlightViewportPadding);
+                    colorLength = Math.Max(0, colorEnd - colorStart);
+                }
+
+                if (colorLength > 0)
+                {
+                    string colorText = colorStart == 0 && colorLength == text.Length
+                        ? text
+                        : text.Substring(colorStart, colorLength);
+
+                    ColorizeRange(colorStart, colorLength, EditorBaseColor);
+                    ApplyRegexColor(HtmlCommentPattern, colorText, colorStart, EditorCommentColor);
+                    ApplyRegexColor(HtmlDoctypePattern, colorText, colorStart, EditorCommentColor);
+                    ApplyHtmlTagColoring(colorText, colorStart);
+                    ApplyRegexColor(HtmlEntityPattern, colorText, colorStart, EditorEntityColor);
+                }
+
+                RestoreEditorSelectionAndScroll(selectionStart, selectionLength, scrollPos);
+            }
+            finally
+            {
+                ResumeControlPainting(_htmlEditor);
+                _htmlEditor.ResumeLayout();
+                _suppressEditorTextChanged = false;
+                _isApplyingSyntaxHighlight = false;
+            }
+        }
+
+        private void RestoreEditorSelectionAndScroll(int selectionStart, int selectionLength, Point scrollPos)
+        {
+            if (_htmlEditor == null)
+                return;
+
+            int textLength = _htmlEditor.TextLength;
+            int safeStart = Math.Clamp(selectionStart, 0, textLength);
+            int safeLength = Math.Clamp(selectionLength, 0, Math.Max(0, textLength - safeStart));
+
+            SetRichTextScrollPosition(_htmlEditor, scrollPos);
+            _htmlEditor.Select(safeStart, safeLength);
+        }
+
+        private void ApplyRegexColor(Regex pattern, string text, int offset, Color color)
+        {
+            foreach (Match match in pattern.Matches(text))
+            {
+                if (match.Success && match.Length > 0)
+                    ColorizeRange(offset + match.Index, match.Length, color);
+            }
+        }
+
+        private void ApplyHtmlTagColoring(string text, int offset)
+        {
+            int i = 0;
+            while (i < text.Length)
+            {
+                if (text[i] != '<')
+                {
+                    i++;
+                    continue;
+                }
+
+                if (StartsWith(text, i, "<!--"))
+                {
+                    int commentEnd = text.IndexOf("-->", i + 4, StringComparison.Ordinal);
+                    if (commentEnd < 0)
+                        break;
+                    i = commentEnd + 3;
+                    continue;
+                }
+
+                int tagEnd = FindTagEnd(text, i + 1);
+                if (tagEnd < 0)
+                    break;
+
+                ColorizeRange(offset + i, 1, EditorTagBracketColor);
+                ColorizeRange(offset + tagEnd, 1, EditorTagBracketColor);
+
+                int cursor = i + 1;
+                if (cursor < tagEnd && text[cursor] == '/')
+                {
+                    ColorizeRange(offset + cursor, 1, EditorTagBracketColor);
+                    cursor++;
+                }
+
+                while (cursor < tagEnd && char.IsWhiteSpace(text[cursor]))
+                    cursor++;
+
+                if (cursor < tagEnd && (text[cursor] == '!' || text[cursor] == '?'))
+                {
+                    i = tagEnd + 1;
+                    continue;
+                }
+
+                int tagNameStart = cursor;
+                while (cursor < tagEnd && IsTagNameChar(text[cursor]))
+                    cursor++;
+                if (cursor > tagNameStart)
+                    ColorizeRange(offset + tagNameStart, cursor - tagNameStart, EditorTagNameColor);
+
+                while (cursor < tagEnd)
+                {
+                    while (cursor < tagEnd && char.IsWhiteSpace(text[cursor]))
+                        cursor++;
+                    if (cursor >= tagEnd)
+                        break;
+
+                    if (text[cursor] == '/')
+                    {
+                        ColorizeRange(offset + cursor, 1, EditorTagBracketColor);
+                        cursor++;
+                        continue;
+                    }
+
+                    int attrNameStart = cursor;
+                    while (cursor < tagEnd && IsAttributeNameChar(text[cursor]))
+                        cursor++;
+
+                    if (cursor == attrNameStart)
+                    {
+                        cursor++;
+                        continue;
+                    }
+
+                    ColorizeRange(offset + attrNameStart, cursor - attrNameStart, EditorAttributeNameColor);
+
+                    while (cursor < tagEnd && char.IsWhiteSpace(text[cursor]))
+                        cursor++;
+
+                    if (cursor < tagEnd && text[cursor] == '=')
+                    {
+                        ColorizeRange(offset + cursor, 1, EditorTagBracketColor);
+                        cursor++;
+                        while (cursor < tagEnd && char.IsWhiteSpace(text[cursor]))
+                            cursor++;
+
+                        if (cursor >= tagEnd)
+                            break;
+
+                        int valueStart = cursor;
+                        if (text[cursor] == '"' || text[cursor] == '\'')
+                        {
+                            char quote = text[cursor];
+                            cursor++;
+                            while (cursor < tagEnd)
+                            {
+                                if (text[cursor] == '\\' && cursor + 1 < tagEnd)
+                                {
+                                    cursor += 2;
+                                    continue;
+                                }
+
+                                if (text[cursor] == quote)
+                                {
+                                    cursor++;
+                                    break;
+                                }
+                                cursor++;
+                            }
+                        }
+                        else
+                        {
+                            while (cursor < tagEnd && !char.IsWhiteSpace(text[cursor]) && text[cursor] != '>')
+                                cursor++;
+                        }
+
+                        if (cursor > valueStart)
+                            ColorizeRange(offset + valueStart, cursor - valueStart, EditorAttributeValueColor);
+                    }
+                }
+
+                i = tagEnd + 1;
+            }
+        }
+
+        private static int FindTagEnd(string text, int startIndex)
+        {
+            bool inSingleQuote = false;
+            bool inDoubleQuote = false;
+
+            for (int i = startIndex; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (c == '\'' && !inDoubleQuote)
+                {
+                    inSingleQuote = !inSingleQuote;
+                    continue;
+                }
+
+                if (c == '"' && !inSingleQuote)
+                {
+                    inDoubleQuote = !inDoubleQuote;
+                    continue;
+                }
+
+                if (c == '>' && !inSingleQuote && !inDoubleQuote)
+                    return i;
+            }
+
+            return -1;
+        }
+
+        private static bool StartsWith(string text, int index, string value)
+        {
+            if (index < 0 || index + value.Length > text.Length)
+                return false;
+
+            for (int i = 0; i < value.Length; i++)
+            {
+                if (text[index + i] != value[i])
+                    return false;
+            }
+            return true;
+        }
+
+        private static bool IsTagNameChar(char c)
+        {
+            return char.IsLetterOrDigit(c) || c == ':' || c == '-' || c == '_';
+        }
+
+        private static bool IsAttributeNameChar(char c)
+        {
+            return char.IsLetterOrDigit(c) || c == ':' || c == '-' || c == '_' || c == '.';
+        }
+
+        private void ColorizeRange(int start, int length, Color color)
+        {
+            if (_htmlEditor == null || start < 0 || length <= 0 || start >= _htmlEditor.TextLength)
+                return;
+
+            int safeLength = Math.Min(length, _htmlEditor.TextLength - start);
+            if (safeLength <= 0)
+                return;
+
+            _htmlEditor.Select(start, safeLength);
+            _htmlEditor.SelectionColor = color;
+        }
+
+        private static void SuspendControlPainting(Control control)
+        {
+            if (control == null || !control.IsHandleCreated)
+                return;
+
+            SendMessage(control.Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        private static void ResumeControlPainting(Control control)
+        {
+            if (control == null || !control.IsHandleCreated)
+                return;
+
+            SendMessage(control.Handle, WM_SETREDRAW, new IntPtr(1), IntPtr.Zero);
+            control.Invalidate();
+            control.Update();
+        }
+
+        private static Point GetRichTextScrollPosition(RichTextBox editor)
+        {
+            if (editor == null || !editor.IsHandleCreated)
+                return Point.Empty;
+
+            IntPtr mem = Marshal.AllocHGlobal(Marshal.SizeOf<NativePoint>());
+            try
+            {
+                Marshal.StructureToPtr(new NativePoint(), mem, false);
+                SendMessage(editor.Handle, EM_GETSCROLLPOS, IntPtr.Zero, mem);
+                var p = Marshal.PtrToStructure<NativePoint>(mem);
+                return new Point(p.X, p.Y);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(mem);
+            }
+        }
+
+        private static void SetRichTextScrollPosition(RichTextBox editor, Point position)
+        {
+            if (editor == null || !editor.IsHandleCreated)
+                return;
+
+            IntPtr mem = Marshal.AllocHGlobal(Marshal.SizeOf<NativePoint>());
+            try
+            {
+                Marshal.StructureToPtr(new NativePoint { X = position.X, Y = position.Y }, mem, false);
+                SendMessage(editor.Handle, EM_SETSCROLLPOS, IntPtr.Zero, mem);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(mem);
+            }
+        }
+
         private async Task RenderEditorToPreviewAsync()
         {
             if (_htmlEditor == null || webView2Control.CoreWebView2 == null)
@@ -2358,7 +2718,10 @@ namespace WebView2WindowsFormsBrowser
         private void HandleResize()
         {
             if (_useChromeLayout)
+            {
+                LayoutChromeContentBounds();
                 return;
+            }
 
             // Resize the webview
             webView2Control.Size = this.ClientSize - new System.Drawing.Size(webView2Control.Location);
@@ -2370,6 +2733,17 @@ namespace WebView2WindowsFormsBrowser
 
             // Resize the URL textbox
             txtUrl.Width = btnGo.Left - txtUrl.Left;
+        }
+
+        private void LayoutChromeContentBounds()
+        {
+            if (!_useChromeLayout || _contentPanel == null || _chromePanel == null || menuStrip1 == null)
+                return;
+
+            int top = menuStrip1.Height + _chromePanel.Height;
+            int height = Math.Max(0, ClientSize.Height - top);
+            _contentPanel.Location = new Point(0, top);
+            _contentPanel.Size = new Size(ClientSize.Width, height);
         }
 
         private Control GetWebViewHost()
@@ -2497,8 +2871,8 @@ namespace WebView2WindowsFormsBrowser
 
             _contentPanel = new Panel
             {
-                Dock = DockStyle.Fill,
-                Padding = new Padding(12),
+                Dock = DockStyle.None,
+                Padding = new Padding(12, 18, 12, 12),
                 BackColor = Color.FromArgb(13, 15, 19)
             };
 
@@ -2509,8 +2883,8 @@ namespace WebView2WindowsFormsBrowser
                 SplitterWidth = 6,
                 BackColor = Color.FromArgb(20, 24, 33)
             };
-            _editorSplit.Panel1.Padding = new Padding(0, 0, 6, 0);
-            _editorSplit.Panel2.Padding = new Padding(6, 0, 0, 0);
+            _editorSplit.Panel1.Padding = new Padding(0, 2, 6, 0);
+            _editorSplit.Panel2.Padding = new Padding(6, 2, 0, 0);
             _editorSplit.Resize += (_, __) => UpdateEditorSplitLayout();
 
             _htmlEditor = new RichTextBox
@@ -2521,7 +2895,7 @@ namespace WebView2WindowsFormsBrowser
                 BorderStyle = BorderStyle.FixedSingle,
                 Font = new Font("Consolas", 11F, FontStyle.Regular),
                 BackColor = Color.FromArgb(14, 17, 24),
-                ForeColor = Color.FromArgb(232, 236, 244),
+                ForeColor = EditorBaseColor,
                 ScrollBars = RichTextBoxScrollBars.Both
             };
             _htmlEditor.TextChanged += htmlEditor_TextChanged;
@@ -2551,6 +2925,12 @@ namespace WebView2WindowsFormsBrowser
                 Interval = 350
             };
             _editorPreviewTimer.Tick += editorPreviewTimer_Tick;
+
+            _editorSyntaxTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 420
+            };
+            _editorSyntaxTimer.Tick += editorSyntaxTimer_Tick;
 
             ApplyButtonStyle(btnBack);
             ApplyButtonStyle(btnForward);
@@ -2640,6 +3020,7 @@ namespace WebView2WindowsFormsBrowser
 
             ResumeLayout(true);
             LayoutAddressBar();
+            LayoutChromeContentBounds();
             UpdateEditorSplitLayout();
             SetEditorText("<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\" />\n  <title>New Document</title>\n</head>\n<body>\n  <h1>Edit HTML on the left</h1>\n  <p>Preview updates live on the right.</p>\n</body>\n</html>", formatHtml: true);
         }
@@ -2813,6 +3194,16 @@ namespace WebView2WindowsFormsBrowser
                 }
             }
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativePoint
+        {
+            public int X;
+            public int Y;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
         private string GetSdkBuildVersion()
         {
