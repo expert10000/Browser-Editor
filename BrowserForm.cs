@@ -1,0 +1,3403 @@
+﻿// Copyright (C) Microsoft Corporation. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using HtmlAgilityPack;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+using SharpBrowser.Controls.BrowserTabStrip.Data;
+
+namespace WebView2WindowsFormsBrowser
+{
+    public partial class BrowserForm : Form
+    {
+        private CoreWebView2CreationProperties _creationProperties = null;
+        private bool _useChromeLayout;
+        private Panel _contentPanel;
+        private GradientPanel _chromePanel;
+        private TableLayoutPanel _chromeLayout;
+        private CenteredFlowLayoutPanel _navPanel;
+        private CenteredFlowLayoutPanel _actionPanel;
+        private Panel _addressShell;
+        private SplitContainer _editorSplit;
+        private Panel _previewHostPanel;
+        private RichTextBox _htmlEditor;
+        private Button _openHtmlButton;
+        private Button _formatHtmlButton;
+        private System.Windows.Forms.Timer _editorPreviewTimer;
+        private bool _suppressEditorTextChanged;
+        private bool _isRenderingEditorPreview;
+        private bool _syncEditorFromNavigation;
+        private Uri _editorBaseUri;
+        public CoreWebView2CreationProperties CreationProperties
+        {
+            get
+            {
+                if (_creationProperties == null)
+                {
+                    _creationProperties = new Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties();
+                }
+                return _creationProperties;
+            }
+            set
+            {
+                _creationProperties = value;
+            }
+        }
+
+        public BrowserForm()
+        {
+            InitializeComponent();
+
+            // Designer protection – skip runtime-only code in design mode
+            if (LicenseManager.UsageMode == LicenseUsageMode.Designtime || DesignMode)
+                return;
+
+            ApplyChromeLayout();
+            AttachControlEventHandlers(this.webView2Control);
+            HandleResize();
+        }
+
+        public BrowserForm(CoreWebView2CreationProperties creationProperties = null)
+        {
+            this.CreationProperties = creationProperties;
+            InitializeComponent();
+
+            // Designer protection – skip runtime-only code in design mode
+            if (LicenseManager.UsageMode == LicenseUsageMode.Designtime || DesignMode)
+                return;
+
+            ApplyChromeLayout();
+            AttachControlEventHandlers(this.webView2Control);
+            HandleResize();
+        }
+
+        private void UpdateTitleWithEvent(string message)
+        {
+            string currentDocumentTitle = this.webView2Control?.CoreWebView2?.DocumentTitle ?? "Uninitialized";
+            this.Text = currentDocumentTitle + " (" + message + ")";
+        }
+
+        CoreWebView2Environment _webViewEnvironment;
+        CoreWebView2Environment WebViewEnvironment
+        {
+            get
+            {
+                if (_webViewEnvironment == null && webView2Control?.CoreWebView2 != null)
+                {
+                    _webViewEnvironment = webView2Control.CoreWebView2.Environment;
+                }
+                return _webViewEnvironment;
+            }
+        }
+
+        CoreWebView2Settings _webViewSettings;
+        CoreWebView2Settings WebViewSettings
+        {
+            get
+            {
+                if (_webViewSettings == null && webView2Control?.CoreWebView2 != null)
+                {
+                    _webViewSettings = webView2Control.CoreWebView2.Settings;
+                }
+                return _webViewSettings;
+            }
+        }
+
+        string _lastInitializeScriptId;
+
+        List<CoreWebView2Frame> _webViewFrames = new List<CoreWebView2Frame>();
+        void WebView_HandleIFrames(object sender, CoreWebView2FrameCreatedEventArgs args)
+        {
+            _webViewFrames.Add(args.Frame);
+            args.Frame.Destroyed += WebViewFrames_DestoryedNestedIFrames;
+        }
+
+        void WebViewFrames_DestoryedNestedIFrames(object sender, object args)
+        {
+            try
+            {
+                var frameToRemove = _webViewFrames.SingleOrDefault(r => r.IsDestroyed() == 1);
+                if (frameToRemove != null)
+                    _webViewFrames.Remove(frameToRemove);
+            }
+            catch (InvalidOperationException ex)
+            {
+                MessageBox.Show(ex.Message);
+            }
+        }
+
+        string WebViewFrames_ToString()
+        {
+            string result = "";
+            for (var i = 0; i < _webViewFrames.Count; i++)
+            {
+                if (i > 0) result += "; ";
+                result += i.ToString() + " " +
+                    (String.IsNullOrEmpty(_webViewFrames[i].Name) ? "<empty_name>" : _webViewFrames[i].Name);
+            }
+            return String.IsNullOrEmpty(result) ? "no iframes available." : result;
+        }
+
+        #region Event Handlers
+        // Enable (or disable) buttons when webview2 is init (or disposed). Similar to the CanExecute feature of WPF.
+        private void UpdateButtons(bool isEnabled)
+        {
+            this.btnEvents.Enabled = isEnabled;
+            this.btnBack.Enabled = isEnabled && webView2Control != null && webView2Control.CanGoBack;
+            this.btnForward.Enabled = isEnabled && webView2Control != null && webView2Control.CanGoForward;
+            this.btnRefresh.Enabled = isEnabled;
+            this.btnGo.Enabled = isEnabled;
+            this.closeWebViewToolStripMenuItem.Enabled = isEnabled;
+            this.allowExternalDropMenuItem.Enabled = isEnabled;
+            this.xToolStripMenuItem.Enabled = isEnabled;
+            this.xToolStripMenuItem1.Enabled = isEnabled;
+            this.xToolStripMenuItem2.Enabled = isEnabled;
+            this.xToolStripMenuItem3.Enabled = isEnabled;
+            this.whiteBackgroundColorMenuItem.Enabled = isEnabled;
+            this.redBackgroundColorMenuItem.Enabled = isEnabled;
+            this.blueBackgroundColorMenuItem.Enabled = isEnabled;
+            this.transparentBackgroundColorMenuItem.Enabled = isEnabled;
+        }
+
+        private void EnableButtons()
+        {
+            UpdateButtons(true);
+        }
+
+        private void DisableButtons(object sender, EventArgs e)
+        {
+            UpdateButtons(false);
+        }
+
+        private void WebView2Control_NavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
+        {
+            UpdateTitleWithEvent("NavigationStarting");
+        }
+
+        private async void WebView2Control_NavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            UpdateTitleWithEvent("NavigationCompleted");
+
+            if (_isRenderingEditorPreview)
+            {
+                _isRenderingEditorPreview = false;
+                return;
+            }
+
+            if (!_syncEditorFromNavigation || !e.IsSuccess)
+                return;
+
+            _syncEditorFromNavigation = false;
+            await SyncEditorWithCurrentPageAsync();
+        }
+
+        private void WebView2Control_SourceChanged(object sender, CoreWebView2SourceChangedEventArgs e)
+        {
+            if (_isRenderingEditorPreview)
+                return;
+
+            if (webView2Control.Source != null)
+                txtUrl.Text = webView2Control.Source.AbsoluteUri;
+        }
+
+        private void WebView2Control_CoreWebView2InitializationCompleted(object sender, CoreWebView2InitializationCompletedEventArgs e)
+        {
+            if (!e.IsSuccess)
+            {
+                MessageBox.Show($"WebView2 creation failed with exception = {e.InitializationException}");
+                UpdateTitleWithEvent("CoreWebView2InitializationCompleted failed");
+                return;
+            }
+
+            // Setup host resource mapping for local files
+            this.webView2Control.CoreWebView2.SetVirtualHostNameToFolderMapping("appassets.example", "assets", CoreWebView2HostResourceAccessKind.DenyCors);
+            _syncEditorFromNavigation = true;
+            this.webView2Control.Source = new Uri(GetStartPageUri(this.webView2Control.CoreWebView2));
+
+            this.webView2Control.CoreWebView2.SourceChanged += CoreWebView2_SourceChanged;
+            this.webView2Control.CoreWebView2.HistoryChanged += CoreWebView2_HistoryChanged;
+            this.webView2Control.CoreWebView2.DocumentTitleChanged += CoreWebView2_DocumentTitleChanged;
+            this.webView2Control.CoreWebView2.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.Image, CoreWebView2WebResourceRequestSourceKinds.Document);
+            this.webView2Control.CoreWebView2.ProcessFailed += CoreWebView2_ProcessFailed;
+            this.webView2Control.CoreWebView2.FrameCreated += WebView_HandleIFrames;
+
+            UpdateTitleWithEvent("CoreWebView2InitializationCompleted succeeded");
+            EnableButtons();
+        }
+
+        void AttachControlEventHandlers(Microsoft.Web.WebView2.WinForms.WebView2 control)
+        {
+            control.CoreWebView2InitializationCompleted += WebView2Control_CoreWebView2InitializationCompleted;
+            control.NavigationStarting += WebView2Control_NavigationStarting;
+            control.NavigationCompleted += WebView2Control_NavigationCompleted;
+            control.SourceChanged += WebView2Control_SourceChanged;
+            control.KeyDown += WebView2Control_KeyDown;
+            control.KeyUp += WebView2Control_KeyUp;
+            control.Disposed += DisableButtons;
+        }
+
+        private void WebView2Control_KeyUp(object sender, KeyEventArgs e)
+        {
+            UpdateTitleWithEvent($"KeyUp key={e.KeyCode}");
+            if (!this.acceleratorKeysEnabledToolStripMenuItem.Checked)
+                e.Handled = true;
+        }
+
+        private void WebView2Control_KeyDown(object sender, KeyEventArgs e)
+        {
+            UpdateTitleWithEvent($"KeyDown key={e.KeyCode}");
+            if (!this.acceleratorKeysEnabledToolStripMenuItem.Checked)
+                e.Handled = true;
+        }
+
+        private void CoreWebView2_HistoryChanged(object sender, object e)
+        {
+            // No explicit check for webView2Control initialization because the events can only start
+            // firing after the CoreWebView2 and its events exist for us to subscribe.
+            btnBack.Enabled = webView2Control.CoreWebView2.CanGoBack;
+            btnForward.Enabled = webView2Control.CoreWebView2.CanGoForward;
+            UpdateTitleWithEvent("HistoryChanged");
+        }
+
+        private void CoreWebView2_SourceChanged(object sender, CoreWebView2SourceChangedEventArgs e)
+        {
+            if (_isRenderingEditorPreview)
+                return;
+
+            if (this.webView2Control.Source != null)
+                this.txtUrl.Text = this.webView2Control.Source.AbsoluteUri;
+            UpdateTitleWithEvent("SourceChanged");
+        }
+
+        private void CoreWebView2_DocumentTitleChanged(object sender, object e)
+        {
+            this.Text = this.webView2Control.CoreWebView2.DocumentTitle;
+            UpdateTitleWithEvent("DocumentTitleChanged");
+        }
+        #endregion
+
+        #region UI event handlers
+        private void BtnRefresh_Click(object sender, EventArgs e)
+        {
+            webView2Control.Reload();
+        }
+
+        private void BtnGo_Click(object sender, EventArgs e)
+        {
+            var rawUrl = txtUrl.Text?.Trim() ?? string.Empty;
+            if (TryLoadLocalHtmlFile(rawUrl))
+                return;
+
+            Uri uri = null;
+
+            if (Uri.IsWellFormedUriString(rawUrl, UriKind.Absolute))
+            {
+                uri = new Uri(rawUrl);
+            }
+            else if (!rawUrl.Contains(" ") && rawUrl.Contains("."))
+            {
+                // An invalid URI contains a dot and no spaces, try tacking http:// on the front.
+                uri = new Uri("http://" + rawUrl);
+            }
+            else
+            {
+                // Otherwise treat it as a web search.
+                uri = new Uri("https://bing.com/search?q=" +
+                    String.Join("+", Uri.EscapeDataString(rawUrl).Split(new string[] { "%20" }, StringSplitOptions.RemoveEmptyEntries)));
+            }
+
+            _editorBaseUri = uri;
+            _syncEditorFromNavigation = true;
+            webView2Control.Source = uri;
+            if (ShouldBlockUri())
+            {
+                _syncEditorFromNavigation = false;
+                webView2Control.CoreWebView2.NavigateToString("You've attempted to navigate to a domain in the blocked sites list. Press back to return to the previous page.");
+            }
+        }
+
+
+        private void btnBack_Click(object sender, EventArgs e)
+        {
+            webView2Control.GoBack();
+        }
+
+        private void btnEvents_Click(object sender, EventArgs e)
+        {
+            (new EventMonitor(this.webView2Control)).Show(this);
+        }
+
+        private void btnForward_Click(object sender, EventArgs e)
+        {
+            webView2Control.GoForward();
+        }
+
+        private void txtUrl_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter)
+                return;
+
+            e.SuppressKeyPress = true;
+            BtnGo_Click(sender, EventArgs.Empty);
+        }
+
+        private void Form_Resize(object sender, EventArgs e)
+        {
+            HandleResize();
+        }
+
+        private void closeWebViewToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            RemoveWebViewFromHost();
+            webView2Control.Dispose();
+        }
+
+        private void createWebViewToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            void EnsureProcessIsClose(uint pid)
+            {
+                try
+                {
+                    var process = Process.GetProcessById((int)pid);
+                    process.Kill();
+                }
+                catch (ArgumentException)
+                {
+                    // Process already exited.
+                }
+            }
+            if (this.webView2Control.CoreWebView2 != null)
+            {
+                var processId = this.webView2Control.CoreWebView2.BrowserProcessId;
+                RemoveWebViewFromHost();
+                this.webView2Control.Dispose();
+                EnsureProcessIsClose(processId);
+            }
+            this.webView2Control = GetReplacementControl(false);
+            PrepareWebViewControl(this.webView2Control);
+            AddWebViewToHost();
+            HandleResize();
+        }
+
+        private void createNewWindowToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            new BrowserForm().Show();
+        }
+
+        private void createNewWindowWithOptionsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            var dialog = new NewWindowOptionsDialog();
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                new BrowserForm(dialog.CreationProperties).Show();
+            }
+        }
+
+        private void ThreadProc(CoreWebView2CreationProperties creationProperties)
+        {
+            try
+            {
+                var creationProps = new CoreWebView2CreationProperties();
+                // The CoreWebView2CreationProperties object cannot be assigned directly, because its member _task will also be assigned.
+                creationProps.BrowserExecutableFolder = creationProperties.BrowserExecutableFolder;
+                creationProps.UserDataFolder = creationProperties.UserDataFolder;
+                creationProps.Language = creationProperties.Language;
+                creationProps.AdditionalBrowserArguments = creationProperties.AdditionalBrowserArguments;
+                creationProps.ProfileName = creationProperties.ProfileName;
+                creationProps.IsInPrivateModeEnabled = creationProperties.IsInPrivateModeEnabled;
+                var tempForm = new BrowserForm(creationProps);
+                tempForm.Show();
+                // Run the message pump
+                Application.Run();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show("Create New Thread Failed: " + exception.Message, "Create New Thread");
+            }
+        }
+
+        private void createNewThreadToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            Thread newFormThread = new Thread(() =>
+            {
+                ThreadProc(webView2Control.CreationProperties);
+            });
+            newFormThread.SetApartmentState(ApartmentState.STA);
+            newFormThread.IsBackground = false;
+            newFormThread.Start();
+        }
+
+        private void xToolStripMenuItem05_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.ZoomFactor = 0.5;
+        }
+
+        private void xToolStripMenuItem1_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.ZoomFactor = 1.0;
+        }
+
+        private void xToolStripMenuItem2_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.ZoomFactor = 2.0;
+        }
+
+        private void xToolStripMenuItem3_Click(object sender, EventArgs e)
+        {
+            MessageBox.Show($"Zoom factor: {this.webView2Control.ZoomFactor}", "WebView Zoom factor");
+        }
+
+        private void backgroundColorMenuItem_Click(object sender, EventArgs e)
+        {
+            var menuItem = (ToolStripMenuItem)sender;
+            Color backgroundColor = Color.FromName(menuItem.Text);
+            this.webView2Control.DefaultBackgroundColor = backgroundColor;
+        }
+
+        private void taskManagerToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                this.webView2Control.CoreWebView2.OpenTaskManagerWindow();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.ToString(), "Open Task Manager Window failed");
+            }
+        }
+
+        private async void methodCDPToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            TextInputDialog dialog = new TextInputDialog(
+              title: "Call CDP Method",
+              description: "Enter the CDP method name to call, followed by a space,\r\n" +
+                "followed by the parameters in JSON format.",
+              defaultInput: "Runtime.evaluate {\"expression\":\"alert(\\\"test\\\")\"}"
+            );
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                string[] words = dialog.inputBox().Trim().Split(' ');
+                if (words.Length == 1 && words[0] == "")
+                {
+                    MessageBox.Show(this, "Invalid argument:" + dialog.inputBox(), "CDP Method call failed");
+                    return;
+                }
+                string methodName = words[0];
+                string methodParams = (words.Length == 2 ? words[1] : "{}");
+
+                try
+                {
+                    string cdpResult = await this.webView2Control.CoreWebView2.CallDevToolsProtocolMethodAsync(methodName, methodParams);
+                    MessageBox.Show(this, cdpResult, "CDP method call successfully");
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, ex.ToString(), "CDP method call failed");
+                }
+            }
+        }
+
+        private void allowExternalDropMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.AllowExternalDrop = this.allowExternalDropMenuItem.Checked;
+        }
+
+        private void setUsersAgentMenuItem_Click(object sender, EventArgs e)
+        {
+            var dialog = new TextInputDialog(
+                title: "SetUserAgent",
+                description: "Enter UserAgent");
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                // <SetUserAgent>
+                WebViewSettings.UserAgent = dialog.inputBox();
+                // </SetUserAgent>
+            }
+        }
+
+        private void getDocumentTitleMenuItem_Click(object sender, EventArgs e)
+        {
+            MessageBox.Show(webView2Control.CoreWebView2.DocumentTitle, "Document Title");
+        }
+
+        private bool _isPrintToPdfInProgress = false;
+        private async void portraitMenuItem_Click(object sender, EventArgs e)
+        {
+            if (_isPrintToPdfInProgress)
+            {
+                MessageBox.Show(this, "Print to PDF in progress", "Print To PDF");
+                return;
+            }
+            try
+            {
+                // <PrintToPdf as Portrait>
+                SaveFileDialog saveFileDialog = new SaveFileDialog();
+                saveFileDialog.InitialDirectory = "C:\\";
+                saveFileDialog.Filter = "Pdf Files|*.pdf";
+                if (saveFileDialog.ShowDialog() == DialogResult.OK)
+                {
+                    _isPrintToPdfInProgress = true;
+                    bool isSuccessful = await webView2Control.CoreWebView2.PrintToPdfAsync(
+                        saveFileDialog.FileName);
+                    _isPrintToPdfInProgress = false;
+                    string message = (isSuccessful) ?
+                        "Print to PDF succeeded" : "Print to PDF failed";
+                    MessageBox.Show(this, message, "Print To PDF Completed");
+                }
+                // </PrintToPdf as Portrait>
+            }
+            catch (NotImplementedException exception)
+            {
+                MessageBox.Show(this, "Print to PDF Failed: " + exception.Message,
+                   "Print to PDF");
+            }
+        }
+
+        private async void landscapeMenuItem_Click(object sender, EventArgs e)
+        {
+            {
+                if (_isPrintToPdfInProgress)
+                {
+                    MessageBox.Show(this, "Print to PDF in progress", "Print To PDF");
+                    return;
+                }
+                try
+                {
+                    // <PrintToPdf as landscape>
+                    CoreWebView2PrintSettings printSettings = WebViewEnvironment.CreatePrintSettings();
+                    printSettings.Orientation = CoreWebView2PrintOrientation.Landscape;
+                    SaveFileDialog saveFileDialog = new SaveFileDialog();
+                    saveFileDialog.InitialDirectory = "C:\\";
+                    saveFileDialog.Filter = "Pdf Files|*.pdf";
+                    if (saveFileDialog.ShowDialog() == DialogResult.OK)
+                    {
+                        _isPrintToPdfInProgress = true;
+                        bool isSuccessful = await webView2Control.CoreWebView2.PrintToPdfAsync(
+                            saveFileDialog.FileName, printSettings);
+                        _isPrintToPdfInProgress = false;
+                        string message = (isSuccessful) ?
+                            "Print to PDF succeeded" : "Print to PDF failed";
+                        MessageBox.Show(this, message, "Print To PDF Completed");
+                    }
+                    // </PrintToPdf as landscape>
+                }
+                catch (NotImplementedException exception)
+                {
+                    MessageBox.Show(this, "Print to PDF Failed: " + exception.Message,
+                       "Print to PDF");
+                }
+            }
+        }
+
+        private void exitMenuItem_Click(object sender, EventArgs e)
+        {
+            if (_isPrintToPdfInProgress)
+            {
+                var selection = MessageBox.Show(
+                    "Print to PDF in progress. Continue closing?",
+                    "Print to PDF", MessageBoxButtons.YesNo);
+                if (selection == DialogResult.No)
+                {
+                    return;
+                }
+            }
+            this.Close();
+        }
+
+        private void getUserDataFolderMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                MessageBox.Show(WebViewEnvironment.UserDataFolder, "User Data Folder");
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, "Get User Data Folder Failed: " + exception.Message, "User Data Folder");
+            }
+        }
+
+        private void toggleVisibilityMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.Visible = this.toggleVisibilityMenuItem.Checked;
+        }
+
+        private void toggleCustomServerCertificateSupportMenuItem_Click(object sender, EventArgs e)
+        {
+            ToggleCustomServerCertificateSupport();
+        }
+
+        private void clearServerCertificateErrorActionsMenuItem_Click(object sender, EventArgs e)
+        {
+            ClearServerCertificateErrorActions();
+        }
+
+        private void toggleDefaultScriptDialogsMenuItem_Click(object sender, EventArgs e)
+        {
+
+            WebViewSettings.AreDefaultScriptDialogsEnabled = !WebViewSettings.AreDefaultScriptDialogsEnabled;
+
+            MessageBox.Show("Default script dialogs will be " + (WebViewSettings.AreDefaultScriptDialogsEnabled ? "enabled" : "disabled"), "after the next navigation.");
+        }
+
+        private void addRemoteObjectMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                this.webView2Control.CoreWebView2.AddHostObjectToScript("bridge", new BridgeAddRemoteObject());
+            }
+            catch (NotSupportedException exception)
+            {
+                MessageBox.Show("CoreWebView2.AddRemoteObject failed: " + exception.Message);
+            }
+
+            this.webView2Control.CoreWebView2.FrameCreated += (s, args) =>
+            {
+                if (args.Frame.Name.Equals("iframe_name"))
+                {
+                    try
+                    {
+                        string[] origins = new string[] { "https://appassets.example" };
+                        args.Frame.AddHostObjectToScript("bridge", new BridgeAddRemoteObject(), origins);
+                    }
+                    catch (NotSupportedException exception)
+                    {
+                        MessageBox.Show("Frame.AddHostObjectToScript failed: " + exception.Message);
+                    }
+                }
+                args.Frame.NameChanged += (nameChangedSender, nameChangedArgs) =>
+                {
+                    CoreWebView2Frame frame = (CoreWebView2Frame)nameChangedSender;
+                    MessageBox.Show("Frame.NameChanged: " + frame.Name);
+                };
+                args.Frame.Destroyed += (frameDestroyedSender, frameDestroyedArgs) =>
+                {
+                    // Handle frame destroyed
+                };
+            };
+
+            this.webView2Control.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                "appassets.example", "assets", CoreWebView2HostResourceAccessKind.DenyCors);
+            this.webView2Control.Source = new Uri("http://google.com");
+        }
+
+        // <DOMContentLoaded>
+        private void domContentLoadedMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.CoreWebView2.DOMContentLoaded += WebView_DOMContentLoaded;
+            this.webView2Control.CoreWebView2.FrameCreated += WebView_FrameCreatedDOMContentLoaded;
+            this.webView2Control.NavigateToString(@"<!DOCTYPE html>" +
+                                      "<h1>DOMContentLoaded sample page</h1>" +
+                                      "<h2>The content to the iframe and below will be added after DOM content is loaded </h2>" +
+                                      "<iframe style='height: 200px; width: 100%;'/>");
+            this.webView2Control.CoreWebView2.NavigationCompleted += (s, args) =>
+            {
+                this.webView2Control.CoreWebView2.DOMContentLoaded -= WebView_DOMContentLoaded;
+                this.webView2Control.CoreWebView2.FrameCreated -= WebView_FrameCreatedDOMContentLoaded;
+            };
+        }
+        void WebView_DOMContentLoaded(object sender, CoreWebView2DOMContentLoadedEventArgs arg)
+        {
+            _ = this.webView2Control.ExecuteScriptAsync(
+                    "let content = document.createElement(\"h2\");" +
+                    "content.style.color = 'blue';" +
+                    "content.textContent = \"This text was added by the host app\";" +
+                    "document.body.appendChild(content);");
+        }
+        void WebView_FrameCreatedDOMContentLoaded(object sender, CoreWebView2FrameCreatedEventArgs args)
+        {
+            args.Frame.DOMContentLoaded += (frameSender, DOMContentLoadedArgs) =>
+            {
+                args.Frame.ExecuteScriptAsync(
+                    "let content = document.createElement(\"h2\");" +
+                    "content.style.color = 'blue';" +
+                    "content.textContent = \"This text was added to the iframe by the host app\";" +
+                    "document.body.appendChild(content);");
+            };
+        }
+        // </DOMContentLoaded>
+
+        private void navigateWithWebResourceRequestMenuItem_Click(object sender, EventArgs e)
+        {
+            // <NavigateWithWebResourceRequest>
+            // Prepare post data as UTF-8 byte array and convert it to stream
+            // as required by the application/x-www-form-urlencoded Content-Type
+            var dialog = new TextInputDialog(
+                title: "NavigateWithWebResourceRequest",
+                description: "Specify post data to submit to https://www.w3schools.com/action_page.php.");
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                string postDataString = "input=" + dialog.inputBox();
+                UTF8Encoding utfEncoding = new UTF8Encoding();
+                byte[] postData = utfEncoding.GetBytes(postDataString);
+                MemoryStream postDataStream = new MemoryStream(postDataString.Length);
+                postDataStream.Write(postData, 0, postData.Length);
+                postDataStream.Seek(0, SeekOrigin.Begin);
+                CoreWebView2WebResourceRequest webResourceRequest =
+                  WebViewEnvironment.CreateWebResourceRequest(
+                    "https://www.w3schools.com/action_page.php",
+                    "POST",
+                    postDataStream,
+                    "Content-Type: application/x-www-form-urlencoded\r\n");
+                this.webView2Control.CoreWebView2.NavigateWithWebResourceRequest(webResourceRequest);
+            }
+            // </NavigateWithWebResourceRequest>
+        }
+
+        // <WebMessage>
+        private void webMessageMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.CoreWebView2.WebMessageReceived += WebView_WebMessageReceived;
+            this.webView2Control.CoreWebView2.FrameCreated += WebView_FrameCreatedWebMessages;
+            this.webView2Control.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                "appassets.example", "assets", CoreWebView2HostResourceAccessKind.DenyCors);
+            this.webView2Control.Source = new Uri("http://google.com");
+        }
+
+        void HandleWebMessage(CoreWebView2WebMessageReceivedEventArgs args, CoreWebView2Frame frame = null)
+        {
+            try
+            {
+                if (args.Source != "http://google.com")
+                {
+                    // Throw exception from untrusted sources.
+                    throw new Exception();
+                }
+
+                string message = args.TryGetWebMessageAsString();
+
+                if (message.Contains("SetTitleText"))
+                {
+                    int msgLength = "SetTitleText".Length;
+                    this.Text = message.Substring(msgLength);
+                }
+                else if (message == "GetWindowBounds")
+                {
+                    string reply = "{\"WindowBounds\":\"Left:" + 0 +
+                                   "\\nTop:" + 0 +
+                                   "\\nRight:" + this.webView2Control.Width +
+                                   "\\nBottom:" + this.webView2Control.Height +
+                                   "\"}";
+                    if (frame != null)
+                    {
+                        frame.PostWebMessageAsJson(reply);
+                    }
+                    else
+                    {
+                        this.webView2Control.CoreWebView2.PostWebMessageAsJson(reply);
+                    }
+                }
+                else
+                {
+                    // Ignore unrecognized messages, but log them
+                    // since it suggests a mismatch between the web content and the host.
+                    Debug.WriteLine($"Unexpected message received: {message}");
+                }
+            }
+            catch (Exception e)
+            {
+                MessageBox.Show($"Unexpected message received: {e.Message}");
+            }
+        }
+
+        void WebView_WebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs args)
+        {
+            HandleWebMessage(args);
+        }
+
+        // <WebMessageReceivedIFrame>
+        void WebView_FrameCreatedWebMessages(object sender, CoreWebView2FrameCreatedEventArgs args)
+        {
+            args.Frame.WebMessageReceived += (WebMessageReceivedSender, WebMessageReceivedArgs) =>
+            {
+                HandleWebMessage(WebMessageReceivedArgs, args.Frame);
+            };
+        }
+        // </WebMessageReceivedIFrame>
+        // </WebMessage>
+        private void toggleMuteStateMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.CoreWebView2.IsMuted = !this.webView2Control.CoreWebView2.IsMuted;
+            MessageBox.Show("Mute state will be " + (this.webView2Control.CoreWebView2.IsMuted ? "enabled" : "disabled"), "Mute");
+        }
+
+        private void aboutToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            MessageBox.Show(this, "WebView2WindowsFormsBrowser, Version 1.0\nCopyright(C) 2023", "About WebView2WindowsFormsBrowser");
+        }
+
+        void AuthenticationMenuItem_Click(object sender, EventArgs e)
+        {
+            // <BasicAuthenticationRequested>
+            this.webView2Control.CoreWebView2.BasicAuthenticationRequested += delegate (object requestSender, CoreWebView2BasicAuthenticationRequestedEventArgs args)
+            {
+                // [SuppressMessage("Microsoft.Security", "CS002:SecretInNextLine", Justification="Demo credentials in https://authenticationtest.com")]
+                args.Response.UserName = "user";
+                // [SuppressMessage("Microsoft.Security", "CS002:SecretInNextLine", Justification="Demo credentials in https://authenticationtest.com")]
+                args.Response.Password = "pass";
+            };
+            this.webView2Control.CoreWebView2.Navigate("https://authenticationtest.com/HTTPAuth");
+            // </BasicAuthenticationRequested>
+        }
+        private void ClearAllDOMStorage(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.AllDomStorage);
+        }
+        private void ClearAllProfileMenuItem_Click(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.AllProfile);
+        }
+
+        private void ClearAllSiteMenuItem_Click(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.AllSite);
+        }
+
+        private void ClearAutofillMenuItem_Click(object sender, EventArgs e)
+        {
+            var kinds = CoreWebView2BrowsingDataKinds.GeneralAutofill |
+                        CoreWebView2BrowsingDataKinds.PasswordAutosave;
+            ClearBrowsingData(sender, e, kinds);
+        }
+
+        private void ClearBrowsingHistory(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.BrowsingHistory);
+        }
+
+        private void ClearCookies(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.Cookies);
+        }
+
+        private void ClearDiskCache(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.DiskCache);
+        }
+
+        private void ClearDownloadHistory(object sender, EventArgs e)
+        {
+            ClearBrowsingData(sender, e, CoreWebView2BrowsingDataKinds.DownloadHistory);
+        }
+
+        // These three wrap your existing methods that take extra parameters:
+        private void GetCookies(object sender, EventArgs e)
+        {
+            GetCookiesMenuItem_Click(sender, e, txtUrl.Text);
+        }
+
+        private void AddOrUpdateCookie(object sender, EventArgs e)
+        {
+            var host = new Uri(txtUrl.Text).Host;
+            AddOrUpdateCookieMenuItem_Click(sender, e, host);
+        }
+
+        private void DeleteCookies(object sender, EventArgs e)
+        {
+            var host = new Uri(txtUrl.Text).Host;
+            DeleteCookiesMenuItem_Click(sender, e, host);
+        }
+        async void ClearBrowsingData(object target, EventArgs e, CoreWebView2BrowsingDataKinds dataKinds)
+        {
+            // Clear the browsing data from the last hour.
+            await this.webView2Control.CoreWebView2.Profile.ClearBrowsingDataAsync(dataKinds);
+            MessageBox.Show(this,
+                "Completed",
+                "Clear Browsing Data");
+            // </ClearBrowsingData>
+        }
+
+        void WebView_ClientCertificateRequested(object sender, CoreWebView2ClientCertificateRequestedEventArgs e)
+        {
+            IReadOnlyList<CoreWebView2ClientCertificate> certificateList = e.MutuallyTrustedCertificates;
+            if (certificateList.Count() > 0)
+            {
+                // There is no significance to the order, picking a certificate arbitrarily.
+                e.SelectedCertificate = certificateList.LastOrDefault();
+            }
+            e.Handled = true;
+        }
+
+        private bool _isCustomClientCertificateSelection = false;
+        void CustomClientCertificateSelectionMenuItem_Click(object sender, EventArgs e)
+        {
+            // Safeguarding the handler when unsupported runtime is used.
+            try
+            {
+                if (!_isCustomClientCertificateSelection)
+                {
+                    this.webView2Control.CoreWebView2.ClientCertificateRequested += WebView_ClientCertificateRequested;
+                }
+                else
+                {
+                    this.webView2Control.CoreWebView2.ClientCertificateRequested -= WebView_ClientCertificateRequested;
+                }
+                _isCustomClientCertificateSelection = !_isCustomClientCertificateSelection;
+
+                MessageBox.Show(this,
+                    _isCustomClientCertificateSelection ? "Custom client certificate selection has been enabled" : "Custom client certificate selection has been disabled",
+                    "Custom client certificate selection");
+            }
+            catch (NotImplementedException exception)
+            {
+                MessageBox.Show(this, "Custom client certificate selection Failed: " + exception.Message, "Custom client certificate selection");
+            }
+        }
+        // <ClientCertificateRequested2>
+        // This example hides the default client certificate dialog and shows a custom dialog instead.
+        // The dialog box displays mutually trusted certificates list and allows the user to select a certificate.
+        // Selecting `OK` will continue the request with a certificate.
+        // Selecting `CANCEL` will continue the request without a certificate
+        private bool _isCustomClientCertificateSelectionDialog = false;
+        void DeferredCustomCertificateDialogMenuItem_Click(object sender, EventArgs e)
+        {
+            // Safeguarding the handler when unsupported runtime is used.
+            try
+            {
+                if (!_isCustomClientCertificateSelectionDialog)
+                {
+                    this.webView2Control.CoreWebView2.ClientCertificateRequested += delegate (
+                        object requestSender, CoreWebView2ClientCertificateRequestedEventArgs args)
+                    {
+                        // Developer can obtain a deferral for the event so that the WebView2
+                        // doesn't examine the properties we set on the event args until
+                        // after the deferral completes asynchronously.
+                        CoreWebView2Deferral deferral = args.GetDeferral();
+
+                        System.Threading.SynchronizationContext.Current.Post((_) =>
+                        {
+                            using (deferral)
+                            {
+                                IReadOnlyList<CoreWebView2ClientCertificate> certificateList = args.MutuallyTrustedCertificates;
+                                if (certificateList.Count() > 0)
+                                {
+                                    // Display custom dialog box for the client certificate selection.
+                                    var dialog = new ClientCertificateSelectionDialog(
+                                                                title: "Select a Certificate for authentication",
+                                                                host: args.Host,
+                                                                port: args.Port,
+                                                                client_cert_list: certificateList);
+                                    if (dialog.ShowDialog() == DialogResult.OK)
+                                    {
+                                        // Continue with the selected certificate to respond to the server if `OK` is selected.
+                                        args.SelectedCertificate = (CoreWebView2ClientCertificate)dialog.CertificateDataBinding.SelectedItems[0].Tag;
+                                    }
+                                }
+                                args.Handled = true;
+                            }
+
+                        }, null);
+                    };
+                    _isCustomClientCertificateSelectionDialog = true;
+                    MessageBox.Show("Custom Client Certificate selection dialog will be used next when WebView2 is making a " +
+                        "request to an HTTP server that needs a client certificate.", "Client certificate selection");
+                }
+            }
+            catch (NotImplementedException exception)
+            {
+                MessageBox.Show(this, "Custom client certificate selection dialog Failed: " + exception.Message, "Client certificate selection");
+            }
+        }
+
+        async void GetCookiesMenuItem_Click(object sender, EventArgs e, string address)
+        {
+            // <GetCookies>
+            List<CoreWebView2Cookie> cookieList = await this.webView2Control.CoreWebView2.CookieManager.GetCookiesAsync(address);
+            StringBuilder cookieResult = new StringBuilder(cookieList.Count + " cookie(s) received from " + address);
+            for (int i = 0; i < cookieList.Count; ++i)
+            {
+                CoreWebView2Cookie cookie = this.webView2Control.CoreWebView2.CookieManager.CreateCookieWithSystemNetCookie(cookieList[i].ToSystemNetCookie());
+                cookieResult.Append($"\n{cookie.Name} {cookie.Value} {(cookie.IsSession ? "[session cookie]" : cookie.Expires.ToString("G"))}");
+            }
+            MessageBox.Show(this, cookieResult.ToString(), "GetCookiesAsync");
+            // </GetCookies>
+        }
+
+        void AddOrUpdateCookieMenuItem_Click(object sender, EventArgs e, string domain)
+        {
+            // <AddOrUpdateCookie>
+            CoreWebView2Cookie cookie = this.webView2Control.CoreWebView2.CookieManager.CreateCookie("CookieName", "CookieValue", domain, "/");
+            this.webView2Control.CoreWebView2.CookieManager.AddOrUpdateCookie(cookie);
+            // </AddOrUpdateCookie>
+        }
+
+        void DeleteAllCookiesMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.CoreWebView2.CookieManager.DeleteAllCookies();
+        }
+
+        void DeleteCookiesMenuItem_Click(object sender, EventArgs e, string domain)
+        {
+            this.webView2Control.CoreWebView2.CookieManager.DeleteCookiesWithDomainAndPath("CookieName", domain, "/");
+        }
+
+        private void showBrowserProcessInfoMenuItem_Click(object sender, EventArgs e)
+        {
+            var browserInfo = this.webView2Control.CoreWebView2.BrowserProcessId;
+            MessageBox.Show(this, "Browser ID: " + browserInfo.ToString(), "Process ID");
+        }
+
+        private void showPerformanceInfoMenuItem_Click(object sender, EventArgs e)
+        {
+            var processInfoList = WebViewEnvironment.GetProcessInfos();
+            var processListCount = processInfoList.Count;
+            string message = "";
+            if (processListCount == 0)
+            {
+                message = "No process found.";
+            }
+            else
+            {
+                message = $"{processListCount} processes found:\n\n";
+                for (int i = 0; i < processListCount; ++i)
+                {
+                    int processId = processInfoList[i].ProcessId;
+                    CoreWebView2ProcessKind processKind = processInfoList[i].Kind;
+                    var proc = Process.GetProcessById(processId);
+                    var memoryInBytes = proc.PrivateMemorySize64;
+                    var b2kb = memoryInBytes / 1024;
+                    message += $"Process ID: {processId}, Process Kind: {processKind}, Memory Usage: {b2kb} KB\n";
+                }
+            }
+            MessageBox.Show(this, message, "Process Info");
+        }
+        // <ProcessFailed>
+        // Register a handler for the ProcessFailed event.
+        // This handler checks the failure kind and tries to:
+        //   * Recreate the webview for browser failure and render unresponsive.
+        //   * Reload the webview for render failure.
+        //   * Reload the webview for frame-only render failure impacting app content.
+        //   * Log information about the failure for other failures.
+        private void CoreWebView2_ProcessFailed(object sender, CoreWebView2ProcessFailedEventArgs e)
+        {
+            void ReinitIfSelectedByUser(string caption, string message)
+            {
+                this.webView2Control.BeginInvoke(new Action(() =>
+                {
+                    var selection = MessageBox.Show(this, message, caption, MessageBoxButtons.YesNo);
+                    if (selection == DialogResult.Yes)
+                    {
+                        RemoveWebViewFromHost();
+                        this.webView2Control.Dispose();
+                        this.webView2Control = GetReplacementControl(false);
+                        PrepareWebViewControl(this.webView2Control);
+                        AddWebViewToHost();
+                        HandleResize();
+                    }
+                }));
+            }
+
+            void ReloadIfSelectedByUser(string caption, string message)
+            {
+                this.webView2Control.BeginInvoke(new Action(() =>
+                {
+                    var selection = MessageBox.Show(this, message, caption, MessageBoxButtons.YesNo);
+                    if (selection == DialogResult.Yes)
+                    {
+                        this.webView2Control.CoreWebView2.Reload();
+                    }
+                }));
+            }
+
+            this.webView2Control.Invoke(new Action(() =>
+            {
+                StringBuilder messageBuilder = new StringBuilder();
+                messageBuilder.AppendLine($"Process kind: {e.ProcessFailedKind}");
+                messageBuilder.AppendLine($"Reason: {e.Reason}");
+                messageBuilder.AppendLine($"Exit code: {e.ExitCode}");
+                messageBuilder.AppendLine($"Process description: {e.ProcessDescription}");
+                MessageBox.Show(messageBuilder.ToString(), "Child process failed", MessageBoxButtons.OK);
+            }));
+
+            if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.BrowserProcessExited)
+            {
+                ReinitIfSelectedByUser("Browser process exited",
+                    "Browser process exited unexpectedly. Recreate webview?");
+            }
+            else if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+            {
+                ReinitIfSelectedByUser("Web page unresponsive",
+                    "Browser render process has stopped responding. Recreate webview?");
+            }
+            else if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessExited)
+            {
+                ReloadIfSelectedByUser("Web page unresponsive",
+                    "Browser render process exited unexpectedly. Reload page?");
+            }
+        }
+        WebView2 GetReplacementControl(bool useNewEnvironment)
+        {
+            WebView2 webView = this.webView2Control;
+            WebView2 replacementControl = new WebView2();
+            ((System.ComponentModel.ISupportInitialize)(replacementControl)).BeginInit();
+            // Setup properties.
+            if (useNewEnvironment)
+            {
+                // Create a new CoreWebView2CreationProperties instance so the environment
+                // is made anew.
+                replacementControl.CreationProperties = new CoreWebView2CreationProperties();
+                replacementControl.CreationProperties.BrowserExecutableFolder = webView.CreationProperties.BrowserExecutableFolder;
+                replacementControl.CreationProperties.Language = webView.CreationProperties.Language;
+                replacementControl.CreationProperties.UserDataFolder = webView.CreationProperties.UserDataFolder;
+                replacementControl.CreationProperties.AdditionalBrowserArguments = webView.CreationProperties.AdditionalBrowserArguments;
+            }
+            else
+            {
+                replacementControl.CreationProperties = webView.CreationProperties;
+            }
+            AttachControlEventHandlers(replacementControl);
+            replacementControl.Source = webView.Source ?? new Uri("https://www.bing.com");
+            ((System.ComponentModel.ISupportInitialize)(replacementControl)).EndInit();
+
+            return replacementControl;
+        }
+        // </ProcessFailed>
+
+        // Crash the browser's process on command, to test crash handlers.
+        private void crashBrowserProcessMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.CoreWebView2.Navigate("edge://inducebrowsercrashforrealz");
+        }
+
+        // Crash the browser's render process on command, to test crash handlers.
+        private void crashRendererProcessMenuItem_Click(object sender, EventArgs e)
+        {
+            this.webView2Control.CoreWebView2.Navigate("edge://kill");
+        }
+
+        // <ServerCertificateError>
+        // When WebView2 doesn't trust a TLS certificate but host app does, this example bypasses
+        // the default TLS interstitial page using the ServerCertificateErrorDetected event handler and
+        // continues the request to a server. Otherwise, cancel the request.
+        private bool _enableServerCertificateError = false;
+        private void ToggleCustomServerCertificateSupport()
+        {
+            // Safeguarding the handler when unsupported runtime is used.
+            try
+            {
+                if (!_enableServerCertificateError)
+                {
+                    this.webView2Control.CoreWebView2.ServerCertificateErrorDetected += WebView_ServerCertificateErrorDetected;
+                }
+                else
+                {
+                    this.webView2Control.CoreWebView2.ServerCertificateErrorDetected -= WebView_ServerCertificateErrorDetected;
+                }
+                _enableServerCertificateError = !_enableServerCertificateError;
+
+                MessageBox.Show(this, "Custom server certificate support has been " +
+                    (_enableServerCertificateError ? "enabled" : "disabled"),
+                    "Custom server certificate support");
+            }
+            catch (NotImplementedException exception)
+            {
+                MessageBox.Show(this, "Custom server certificate support failed: " + exception.Message, "Custom server certificate support");
+            }
+        }
+
+        private void WebView_ServerCertificateErrorDetected(object sender, CoreWebView2ServerCertificateErrorDetectedEventArgs e)
+        {
+            CoreWebView2Certificate certificate = e.ServerCertificate;
+
+            // Continues the request to a server with a TLS certificate if the error status
+            // is of type `COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_IS_INVALID`
+            // and trusted by the host app.
+            if (e.ErrorStatus == CoreWebView2WebErrorStatus.CertificateIsInvalid &&
+                            ValidateServerCertificate(certificate))
+            {
+                e.Action = CoreWebView2ServerCertificateErrorAction.AlwaysAllow;
+            }
+            else
+            {
+                // Cancel the request for other TLS certificate error types or if untrusted by the host app.
+                e.Action = CoreWebView2ServerCertificateErrorAction.Cancel;
+            }
+        }
+
+        // Function to validate the server certificate for untrusted root or self-signed certificate.
+        // You may also choose to defer server certificate validation.
+        bool ValidateServerCertificate(CoreWebView2Certificate certificate)
+        {
+            // You may want to validate certificates in different ways depending on your app and
+            // scenario. One way might be the following:
+            // First, get the list of host app trusted certificates and its thumbprint.
+            //
+            // Then get the last chain element using `ICoreWebView2Certificate::get_PemEncodedIssuerCertificateChain`
+            // that contains the raw data of the untrusted root CA/self-signed certificate. Get the untrusted
+            // root CA/self signed certificate thumbprint from the raw certificate data and validate the thumbprint
+            // against the host app trusted certificate list.
+            //
+            // Finally, return true if it exists in the host app's certificate trusted list, or otherwise return false.
+            return true;
+        }
+
+        // This example clears `AlwaysAllow` response that are added for proceeding with TLS certificate errors.
+        async void ClearServerCertificateErrorActions()
+        {
+            await this.webView2Control.CoreWebView2.ClearServerCertificateErrorActionsAsync();
+            MessageBox.Show(this, "message", "Clear server certificate error actions are succeeded");
+        }
+        // </ServerCertificateError>
+
+        // Prompt the user for a list of blocked domains
+        private bool _blockedSitesSet = false;
+        private HashSet<string> _blockedSitesList = new HashSet<string>();
+        private void blockedDomainsMenuItem_Click(object sender, EventArgs e)
+        {
+            var blockedSitesString = "";
+            if (_blockedSitesSet)
+            {
+                blockedSitesString = String.Join(";", _blockedSitesList);
+            }
+            else
+            {
+                blockedSitesString = "foo.com;bar.org";
+            }
+            var textDialog = new TextInputDialog(
+                title: "Blocked Domains",
+                description: "Enter hostnames to block, sparately by semicolons",
+                defaultInput: blockedSitesString);
+            if (textDialog.ShowDialog() == DialogResult.OK)
+            {
+                _blockedSitesSet = true;
+                _blockedSitesList.Clear();
+                if (textDialog.inputBox() != null)
+                {
+                    string[] textcontent = textDialog.inputBox().Split(';');
+                    foreach (string site in textcontent)
+                    {
+                        _blockedSitesList.Add(site);
+                    }
+                }
+            }
+
+        }
+
+        // Check the URI against the blocked sites list
+        private bool ShouldBlockUri()
+        {
+            foreach (string site in _blockedSitesList)
+            {
+                if (site.Equals(txtUrl.Text))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private async void injectScriptMenuItem_Click(object sender, EventArgs e)
+        {
+            // <ExecuteScript>
+            var dialog = new TextInputDialog(
+                title: "Inject Script",
+                description: "Enter some JavaScript to be executed in the context of this page.",
+                defaultInput: "window.getComputedStyle(document.body).backgroundColor");
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                try
+                {
+                    string scriptResult = await this.webView2Control.ExecuteScriptAsync(dialog.inputBox());
+                    MessageBox.Show(this, scriptResult, "Script Result");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    MessageBox.Show(this, ex.Message, "Execute Script Fails");
+                }
+            }
+            // </ExecuteScript>
+        }
+
+        private async void injectScriptIntoFrameMenuItem_Click(object sender, EventArgs e)
+        {
+            // <ExecuteScriptFrame>
+            string iframesData = WebViewFrames_ToString();
+            string iframesInfo = "Enter iframe to run the JavaScript code in.\r\nAvailable iframes: " + iframesData;
+            var dialogIFrames = new TextInputDialog(
+                title: "Inject Script Into IFrame",
+                description: iframesInfo,
+                defaultInput: "0");
+            if (dialogIFrames.ShowDialog() == DialogResult.OK)
+            {
+                int iframeNumber = -1;
+                try
+                {
+                    iframeNumber = Int32.Parse(dialogIFrames.inputBox());
+                }
+                catch (FormatException)
+                {
+                    Console.WriteLine("Can not convert " + dialogIFrames.inputBox() + " to int");
+                }
+                if (iframeNumber >= 0 && iframeNumber < _webViewFrames.Count)
+                {
+                    var dialog = new TextInputDialog(
+                        title: "Inject Script",
+                        description: "Enter some JavaScript to be executed in the context of iframe " + dialogIFrames.inputBox(),
+                        defaultInput: "window.getComputedStyle(document.body).backgroundColor");
+                    if (dialog.ShowDialog() == DialogResult.OK)
+                    {
+                        try
+                        {
+                            string scriptResult = await _webViewFrames[iframeNumber].ExecuteScriptAsync(dialog.inputBox());
+                            MessageBox.Show(this, scriptResult, "Script Result");
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            MessageBox.Show(this, ex.Message, "Execute Script Frame Fails");
+                        }
+                    }
+                }
+                else
+                {
+                    MessageBox.Show("Can not read frame index or it is out of available range");
+                }
+            }
+            // </ExecuteScriptFrame>
+        }
+
+        // Prompt the user for some scripts and register it to execute whenever a new page loads.
+        private async void addInitializeScriptMenuItem_Click(object sender, EventArgs e)
+        {
+            TextInputDialog dialog = new TextInputDialog(
+              title: "Add Initialize Script",
+              description: "Enter the JavaScript code to run as the initialization script that runs before any script in the HTML document.",
+              // This example script stops child frames from opening new windows.  Because
+              // the initialization script runs before any script in the HTML document, we
+              // can trust the results of our checks on window.parent and window.top.
+              defaultInput: "if (window.parent !== window.top) {\r\n" +
+              "    delete window.open;\r\n" +
+              "}");
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                try
+                {
+                    string scriptId = await this.webView2Control.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(dialog.inputBox());
+                    _lastInitializeScriptId = scriptId;
+                    MessageBox.Show(this, scriptId, "AddScriptToExecuteOnDocumentCreated Id");
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, ex.ToString(), "AddScriptToExecuteOnDocumentCreated failed");
+                }
+            }
+        }
+
+        // Prompt the user for an initialization script ID and deregister that script.
+        private void removeInitializeScriptMenuItem_Click(object sender, EventArgs e)
+        {
+            TextInputDialog dialog = new TextInputDialog(
+              title: "Remove Initialize Script",
+              description: "Enter the ID created from Add Initialize Script.",
+              defaultInput: _lastInitializeScriptId);
+            if (dialog.ShowDialog() == DialogResult.OK)
+            {
+                string scriptId = dialog.inputBox();
+                // check valid
+                try
+                {
+                    Int64 result = Int64.Parse(scriptId);
+                    Int64 lastId = Int64.Parse(_lastInitializeScriptId);
+                    if (result > lastId)
+                    {
+                        MessageBox.Show(this, scriptId, "Invalid ScriptId, should be less or equal than " + _lastInitializeScriptId);
+                    }
+                    else
+                    {
+                        this.webView2Control.CoreWebView2.RemoveScriptToExecuteOnDocumentCreated(scriptId);
+                        if (result == lastId && lastId >= 2)
+                        {
+                            _lastInitializeScriptId = (lastId - 1).ToString();
+                        }
+                        MessageBox.Show(this, scriptId, "RemoveScriptToExecuteOnDocumentCreated Id");
+                    }
+                }
+                catch (FormatException)
+                {
+                    MessageBox.Show(this, scriptId, "Invalid ScriptId, should be Integer");
+
+                }
+            }
+        }
+
+        // Prompt the user for a string and then post it as a web message.
+        private void postMessageStringMenuItem_Click(object sender, EventArgs e)
+        {
+            var dialog = new TextInputDialog(
+                title: "Post Web Message String",
+                description: "Web message string:\r\nEnter the web message as a string.");
+
+            try
+            {
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    this.webView2Control.CoreWebView2.PostWebMessageAsString(dialog.inputBox());
+                }
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, "PostMessageAsString Failed: " + exception.Message,
+                   "Post Message As String");
+            }
+        }
+
+        // Prompt the user for some JSON and then post it as a web message.
+        private void postMessageJsonMenuItem_Click(object sender, EventArgs e)
+        {
+            var dialog = new TextInputDialog(
+                title: "Post Web Message JSON",
+                description: "Web message JSON:\r\nEnter the web message as JSON.",
+                 defaultInput: "{\"SetColor\":\"blue\"}");
+
+            try
+            {
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    this.webView2Control.CoreWebView2.PostWebMessageAsJson(dialog.inputBox());
+                }
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, "PostMessageAsJSON Failed: " + exception.Message,
+                   "Post Message As JSON");
+            }
+        }
+
+        // Prompt the user for a string and then post it as a web message to the first iframe.
+        private void postMessageStringIframeMenuItem_Click(object sender, EventArgs e)
+        {
+            var dialog = new TextInputDialog(
+                title: "Post Web Message String Iframe",
+                description: "Web message string:\r\nEnter the web message as a string.");
+
+            try
+            {
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    if (_webViewFrames.Count != 0)
+                    {
+                        _webViewFrames[0].PostWebMessageAsString(dialog.inputBox());
+                    }
+                    else
+                    {
+                        MessageBox.Show("No iframes found");
+                    }
+                }
+
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, "PostMessageAsStringIframe Failed: " + exception.Message,
+                   "Post Message As String");
+            }
+        }
+
+        // Prompt the user for some JSON and then post it as a web message to the first iframe.
+        private void postMessageJsonIframeMenuItem_Click(object sender, EventArgs e)
+        {
+            var dialog = new TextInputDialog(
+                title: "Post Web Message JSON Iframe",
+                description: "Web message JSON:\r\nEnter the web message as JSON.",
+                 defaultInput: "{\"SetColor\":\"blue\"}");
+
+            try
+            {
+                if (dialog.ShowDialog() == DialogResult.OK)
+                {
+                    if (_webViewFrames.Count != 0)
+                    {
+                        _webViewFrames[0].PostWebMessageAsJson(dialog.inputBox());
+                    }
+                    else
+                    {
+                        MessageBox.Show("No iframes found");
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, "PostMessageAsJSONIframe Failed: " + exception.Message,
+                   "Post Message As JSON");
+            }
+        }
+        #endregion
+
+        private void openHtmlButton_Click(object sender, EventArgs e)
+        {
+            using var dialog = new OpenFileDialog
+            {
+                Filter = "HTML Files (*.html;*.htm)|*.html;*.htm|All Files (*.*)|*.*",
+                Title = "Open HTML File"
+            };
+
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+                LoadHtmlFileIntoEditor(dialog.FileName);
+        }
+
+        private void formatHtmlButton_Click(object sender, EventArgs e)
+        {
+            if (_htmlEditor == null)
+                return;
+
+            SetEditorText(_htmlEditor.Text, formatHtml: true, resetCaret: false);
+            _ = RenderEditorToPreviewAsync();
+        }
+
+        private bool TryLoadLocalHtmlFile(string rawInput)
+        {
+            if (string.IsNullOrWhiteSpace(rawInput))
+                return false;
+
+            string candidatePath = rawInput;
+            if (Uri.TryCreate(rawInput, UriKind.Absolute, out var uri) && uri.IsFile)
+                candidatePath = uri.LocalPath;
+
+            if (!Path.IsPathRooted(candidatePath))
+                return false;
+
+            var fullPath = Path.GetFullPath(candidatePath);
+            if (!File.Exists(fullPath))
+                return false;
+
+            var ext = Path.GetExtension(fullPath);
+            bool isHtml = ext.Equals(".html", StringComparison.OrdinalIgnoreCase) ||
+                          ext.Equals(".htm", StringComparison.OrdinalIgnoreCase);
+            if (!isHtml)
+                return false;
+
+            LoadHtmlFileIntoEditor(fullPath);
+            return true;
+        }
+
+        private void LoadHtmlFileIntoEditor(string filePath)
+        {
+            try
+            {
+                string html = File.ReadAllText(filePath);
+                _editorBaseUri = new Uri(filePath);
+                _syncEditorFromNavigation = false;
+                txtUrl.Text = filePath;
+                SetEditorText(html, formatHtml: true);
+                _ = RenderEditorToPreviewAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Unable to open HTML file:\n" + ex.Message, "Open HTML");
+            }
+        }
+
+        private void htmlEditor_TextChanged(object sender, EventArgs e)
+        {
+            if (_suppressEditorTextChanged || _editorPreviewTimer == null)
+                return;
+
+            _editorPreviewTimer.Stop();
+            _editorPreviewTimer.Start();
+        }
+
+        private async void editorPreviewTimer_Tick(object sender, EventArgs e)
+        {
+            _editorPreviewTimer.Stop();
+            await RenderEditorToPreviewAsync();
+        }
+
+        private async Task SyncEditorWithCurrentPageAsync()
+        {
+            if (webView2Control.CoreWebView2 == null || _htmlEditor == null)
+                return;
+
+            try
+            {
+                string html = await GetPageHtmlWithDocTypeAsync();
+                _editorBaseUri = webView2Control.Source;
+                SetEditorText(html, formatHtml: true);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Could not read page source:\n" + ex.Message, "Load HTML Source");
+            }
+        }
+
+        private async Task<string> GetPageHtmlWithDocTypeAsync()
+        {
+            var core = webView2Control.CoreWebView2;
+            if (core == null)
+                return string.Empty;
+
+            const string script = @"(() => {
+                const dt = document.doctype;
+                let docType = '';
+                if (dt) {
+                    docType = '<!DOCTYPE ' + dt.name;
+                    if (dt.publicId) {
+                        docType += ' PUBLIC ""' + dt.publicId + '""';
+                    } else if (dt.systemId) {
+                        docType += ' SYSTEM';
+                    }
+                    if (dt.systemId) {
+                        docType += ' ""' + dt.systemId + '""';
+                    }
+                    docType += '>';
+                }
+                return docType + '\n' + document.documentElement.outerHTML;
+            })();";
+
+            string raw = await core.ExecuteScriptAsync(script);
+            return JsonSerializer.Deserialize<string>(raw) ?? string.Empty;
+        }
+
+        private void SetEditorText(string html, bool formatHtml = false, bool resetCaret = true)
+        {
+            if (_htmlEditor == null)
+                return;
+
+            string editorText = formatHtml ? FormatHtmlForEditor(html) : (html ?? string.Empty);
+            _suppressEditorTextChanged = true;
+            _htmlEditor.Text = editorText;
+            if (resetCaret)
+            {
+                _htmlEditor.SelectionStart = 0;
+                _htmlEditor.SelectionLength = 0;
+            }
+            _suppressEditorTextChanged = false;
+        }
+
+        private static string FormatHtmlForEditor(string html)
+        {
+            if (string.IsNullOrWhiteSpace(html))
+                return string.Empty;
+
+            try
+            {
+                var doc = new HtmlAgilityPack.HtmlDocument
+                {
+                    OptionFixNestedTags = true
+                };
+                doc.LoadHtml(html);
+
+                var sb = new StringBuilder(html.Length + (html.Length / 4));
+                foreach (var node in doc.DocumentNode.ChildNodes)
+                {
+                    AppendFormattedNode(node, sb, 0);
+                }
+
+                string formatted = sb.ToString().Trim();
+                return string.IsNullOrWhiteSpace(formatted) ? html : formatted;
+            }
+            catch
+            {
+                return html;
+            }
+        }
+
+        private static void AppendFormattedNode(HtmlNode node, StringBuilder sb, int depth)
+        {
+            if (node == null)
+                return;
+
+            string indent = new string(' ', depth * 2);
+
+            switch (node.NodeType)
+            {
+                case HtmlNodeType.Document:
+                    foreach (var child in node.ChildNodes)
+                        AppendFormattedNode(child, sb, depth);
+                    return;
+
+                case HtmlNodeType.Comment:
+                    sb.Append(indent).Append("<!--").Append(node.InnerHtml).AppendLine("-->");
+                    return;
+
+                case HtmlNodeType.Text:
+                    string rawText = node.InnerText;
+                    if (string.IsNullOrWhiteSpace(rawText))
+                        return;
+                    sb.Append(indent).AppendLine(rawText.Trim());
+                    return;
+
+                case HtmlNodeType.Element:
+                    break;
+
+                default:
+                    if (!string.IsNullOrWhiteSpace(node.OuterHtml))
+                        sb.Append(indent).AppendLine(node.OuterHtml.Trim());
+                    return;
+            }
+
+            string name = node.Name?.ToLowerInvariant() ?? string.Empty;
+            bool preserveInner = name == "script" || name == "style" || name == "pre" || name == "textarea";
+            bool hasChildren = node.ChildNodes.Count > 0;
+            bool isVoid = IsVoidElement(name);
+            string openTag = BuildOpenTag(node);
+
+            if (!hasChildren || (isVoid && !preserveInner))
+            {
+                sb.Append(indent).AppendLine(openTag);
+                return;
+            }
+
+            if (preserveInner)
+            {
+                sb.Append(indent).AppendLine(openTag);
+                string formattedInner = FormatPreservedContent(name, node);
+                AppendIndentedMultiline(sb, formattedInner, indent + "  ");
+                sb.Append(indent).Append("</").Append(node.Name).AppendLine(">");
+                return;
+            }
+
+            bool singleTextChild = node.ChildNodes.Count == 1 &&
+                                   node.ChildNodes[0].NodeType == HtmlNodeType.Text &&
+                                   !string.IsNullOrWhiteSpace(node.ChildNodes[0].InnerText);
+
+            if (singleTextChild)
+            {
+                string content = node.ChildNodes[0].InnerText.Trim();
+                sb.Append(indent).Append(openTag).Append(content).Append("</").Append(node.Name).AppendLine(">");
+                return;
+            }
+
+            sb.Append(indent).AppendLine(openTag);
+            foreach (var child in node.ChildNodes)
+                AppendFormattedNode(child, sb, depth + 1);
+            sb.Append(indent).Append("</").Append(node.Name).AppendLine(">");
+        }
+
+        private static string BuildOpenTag(HtmlNode node)
+        {
+            var sb = new StringBuilder();
+            sb.Append('<').Append(node.Name);
+            foreach (var attribute in node.Attributes)
+            {
+                sb.Append(' ').Append(attribute.Name).Append("=\"")
+                    .Append((attribute.Value ?? string.Empty).Replace("\"", "&quot;"))
+                    .Append('"');
+            }
+            sb.Append('>');
+            return sb.ToString();
+        }
+
+        private static bool IsVoidElement(string name)
+        {
+            return name == "area" || name == "base" || name == "br" || name == "col" || name == "embed" ||
+                   name == "hr" || name == "img" || name == "input" || name == "link" || name == "meta" ||
+                   name == "param" || name == "source" || name == "track" || name == "wbr";
+        }
+
+        private static string FormatPreservedContent(string tagName, HtmlNode node)
+        {
+            string inner = node.InnerHtml ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(inner))
+                return string.Empty;
+
+            if (tagName == "script")
+            {
+                string type = node.GetAttributeValue("type", string.Empty)?.Trim().ToLowerInvariant() ?? string.Empty;
+                if (type.Contains("json"))
+                    return FormatJsonContent(inner);
+                return FormatJavaScriptContent(inner);
+            }
+
+            if (tagName == "style")
+                return FormatCssContent(inner);
+
+            return NormalizeMultiline(inner);
+        }
+
+        private static string NormalizeMultiline(string content)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+                return string.Empty;
+
+            var sb = new StringBuilder(content.Length);
+            using var reader = new StringReader(content);
+            string line;
+            bool first = true;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (!first)
+                    sb.Append('\n');
+                sb.Append(line.TrimEnd());
+                first = false;
+            }
+            return sb.ToString().Trim();
+        }
+
+        private static void AppendIndentedMultiline(StringBuilder sb, string content, string indent)
+        {
+            if (string.IsNullOrEmpty(content))
+                return;
+
+            using var reader = new StringReader(content);
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (line.Length == 0)
+                {
+                    sb.AppendLine();
+                }
+                else
+                {
+                    sb.Append(indent).AppendLine(line);
+                }
+            }
+        }
+
+        private static string FormatJsonContent(string content)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(content);
+                return JsonSerializer.Serialize(doc.RootElement, new JsonSerializerOptions { WriteIndented = true });
+            }
+            catch
+            {
+                return NormalizeMultiline(content);
+            }
+        }
+
+        private static string FormatJavaScriptContent(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                return string.Empty;
+
+            var sb = new StringBuilder(input.Length + (input.Length / 3));
+            int indent = 0;
+            int parenDepth = 0;
+            bool atLineStart = true;
+            bool inSingle = false;
+            bool inDouble = false;
+            bool inTemplate = false;
+            bool inLineComment = false;
+            bool inBlockComment = false;
+            bool escape = false;
+
+            void TrimTrailingSpaces()
+            {
+                while (sb.Length > 0 && (sb[sb.Length - 1] == ' ' || sb[sb.Length - 1] == '\t'))
+                    sb.Length--;
+            }
+
+            void EnsureIndent()
+            {
+                if (!atLineStart)
+                    return;
+                sb.Append(' ', Math.Max(0, indent) * 2);
+                atLineStart = false;
+            }
+
+            void AppendChar(char c)
+            {
+                EnsureIndent();
+                sb.Append(c);
+                atLineStart = false;
+            }
+
+            void NewLine()
+            {
+                TrimTrailingSpaces();
+                if (sb.Length == 0 || sb[sb.Length - 1] != '\n')
+                    sb.Append('\n');
+                atLineStart = true;
+            }
+
+            bool IsWord(char c) => char.IsLetterOrDigit(c) || c == '_' || c == '$';
+
+            char PeekNextNonWhitespace(int index)
+            {
+                for (int j = index + 1; j < input.Length; j++)
+                {
+                    char candidate = input[j];
+                    if (!char.IsWhiteSpace(candidate))
+                        return candidate;
+                }
+                return '\0';
+            }
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                char c = input[i];
+                char next = i + 1 < input.Length ? input[i + 1] : '\0';
+
+                if (inLineComment)
+                {
+                    AppendChar(c);
+                    if (c == '\n')
+                    {
+                        inLineComment = false;
+                        atLineStart = true;
+                    }
+                    continue;
+                }
+
+                if (inBlockComment)
+                {
+                    AppendChar(c);
+                    if (c == '*' && next == '/')
+                    {
+                        AppendChar('/');
+                        i++;
+                        inBlockComment = false;
+                    }
+                    continue;
+                }
+
+                if (inSingle || inDouble || inTemplate)
+                {
+                    AppendChar(c);
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+
+                    if (c == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+
+                    if (inSingle && c == '\'')
+                        inSingle = false;
+                    else if (inDouble && c == '"')
+                        inDouble = false;
+                    else if (inTemplate && c == '`')
+                        inTemplate = false;
+                    continue;
+                }
+
+                if (char.IsWhiteSpace(c))
+                {
+                    if (c == '\n' || c == '\r')
+                        continue;
+
+                    char prev = sb.Length > 0 ? sb[sb.Length - 1] : '\0';
+                    char nextNonWs = PeekNextNonWhitespace(i);
+                    if (IsWord(prev) && IsWord(nextNonWs))
+                        AppendChar(' ');
+                    continue;
+                }
+
+                if (c == '/' && next == '/')
+                {
+                    EnsureIndent();
+                    sb.Append("//");
+                    atLineStart = false;
+                    inLineComment = true;
+                    i++;
+                    continue;
+                }
+
+                if (c == '/' && next == '*')
+                {
+                    EnsureIndent();
+                    sb.Append("/*");
+                    atLineStart = false;
+                    inBlockComment = true;
+                    i++;
+                    continue;
+                }
+
+                if (c == '\'')
+                {
+                    inSingle = true;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inDouble = true;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '`')
+                {
+                    inTemplate = true;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '(')
+                {
+                    parenDepth++;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == ')')
+                {
+                    parenDepth = Math.Max(0, parenDepth - 1);
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '{')
+                {
+                    AppendChar('{');
+                    indent++;
+                    NewLine();
+                    continue;
+                }
+
+                if (c == '}')
+                {
+                    indent = Math.Max(0, indent - 1);
+                    NewLine();
+                    AppendChar('}');
+                    char nextNonWs = PeekNextNonWhitespace(i);
+                    if (nextNonWs != ';' && nextNonWs != ',' && nextNonWs != ')' && nextNonWs != '\0')
+                        NewLine();
+                    continue;
+                }
+
+                if (c == ';')
+                {
+                    AppendChar(';');
+                    if (parenDepth == 0)
+                        NewLine();
+                    else
+                        AppendChar(' ');
+                    continue;
+                }
+
+                if (c == ',')
+                {
+                    AppendChar(',');
+                    if (parenDepth <= 1)
+                        AppendChar(' ');
+                    continue;
+                }
+
+                AppendChar(c);
+            }
+
+            string formatted = sb.ToString().Trim();
+            return CollapseExcessBlankLines(formatted);
+        }
+
+        private static string FormatCssContent(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                return string.Empty;
+
+            var sb = new StringBuilder(input.Length + (input.Length / 3));
+            int indent = 0;
+            int parenDepth = 0;
+            bool atLineStart = true;
+            bool inSingle = false;
+            bool inDouble = false;
+            bool inComment = false;
+            bool escape = false;
+
+            void TrimTrailingSpaces()
+            {
+                while (sb.Length > 0 && (sb[sb.Length - 1] == ' ' || sb[sb.Length - 1] == '\t'))
+                    sb.Length--;
+            }
+
+            void EnsureIndent()
+            {
+                if (!atLineStart)
+                    return;
+                sb.Append(' ', Math.Max(0, indent) * 2);
+                atLineStart = false;
+            }
+
+            void AppendChar(char c)
+            {
+                EnsureIndent();
+                sb.Append(c);
+                atLineStart = false;
+            }
+
+            void NewLine()
+            {
+                TrimTrailingSpaces();
+                if (sb.Length == 0 || sb[sb.Length - 1] != '\n')
+                    sb.Append('\n');
+                atLineStart = true;
+            }
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                char c = input[i];
+                char next = i + 1 < input.Length ? input[i + 1] : '\0';
+
+                if (inComment)
+                {
+                    AppendChar(c);
+                    if (c == '*' && next == '/')
+                    {
+                        AppendChar('/');
+                        i++;
+                        inComment = false;
+                        NewLine();
+                    }
+                    continue;
+                }
+
+                if (inSingle || inDouble)
+                {
+                    AppendChar(c);
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+
+                    if (c == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+
+                    if (inSingle && c == '\'')
+                        inSingle = false;
+                    else if (inDouble && c == '"')
+                        inDouble = false;
+                    continue;
+                }
+
+                if (char.IsWhiteSpace(c))
+                {
+                    if (c == '\n' || c == '\r')
+                        continue;
+                    if (sb.Length > 0 && sb[sb.Length - 1] != ' ' && sb[sb.Length - 1] != '\n')
+                        AppendChar(' ');
+                    continue;
+                }
+
+                if (c == '/' && next == '*')
+                {
+                    EnsureIndent();
+                    sb.Append("/*");
+                    atLineStart = false;
+                    inComment = true;
+                    i++;
+                    continue;
+                }
+
+                if (c == '\'')
+                {
+                    inSingle = true;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inDouble = true;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '(')
+                {
+                    parenDepth++;
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == ')')
+                {
+                    parenDepth = Math.Max(0, parenDepth - 1);
+                    AppendChar(c);
+                    continue;
+                }
+
+                if (c == '{')
+                {
+                    AppendChar('{');
+                    indent++;
+                    NewLine();
+                    continue;
+                }
+
+                if (c == '}')
+                {
+                    indent = Math.Max(0, indent - 1);
+                    NewLine();
+                    AppendChar('}');
+                    NewLine();
+                    continue;
+                }
+
+                if (c == ';')
+                {
+                    AppendChar(';');
+                    if (parenDepth == 0)
+                        NewLine();
+                    continue;
+                }
+
+                if (c == ':')
+                {
+                    AppendChar(':');
+                    if (next != ' ')
+                        AppendChar(' ');
+                    continue;
+                }
+
+                if (c == ',')
+                {
+                    AppendChar(',');
+                    if (next != ' ')
+                        AppendChar(' ');
+                    continue;
+                }
+
+                AppendChar(c);
+            }
+
+            string formatted = sb.ToString().Trim();
+            return CollapseExcessBlankLines(formatted);
+        }
+
+        private static string CollapseExcessBlankLines(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+                return string.Empty;
+
+            var sb = new StringBuilder(input.Length);
+            int blankRun = 0;
+            using var reader = new StringReader(input);
+            string line;
+            bool first = true;
+            while ((line = reader.ReadLine()) != null)
+            {
+                bool blank = string.IsNullOrWhiteSpace(line);
+                if (blank)
+                {
+                    blankRun++;
+                    if (blankRun > 1)
+                        continue;
+                }
+                else
+                {
+                    blankRun = 0;
+                }
+
+                if (!first)
+                    sb.Append('\n');
+                sb.Append(line.TrimEnd());
+                first = false;
+            }
+            return sb.ToString();
+        }
+
+        private async Task RenderEditorToPreviewAsync()
+        {
+            if (_htmlEditor == null || webView2Control.CoreWebView2 == null)
+                return;
+
+            string html = _htmlEditor.Text;
+            if (string.IsNullOrWhiteSpace(html))
+            {
+                html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
+            }
+
+            string htmlForPreview = EnsureBaseTag(html);
+            _syncEditorFromNavigation = false;
+            _isRenderingEditorPreview = true;
+            webView2Control.CoreWebView2.NavigateToString(htmlForPreview);
+            await Task.CompletedTask;
+        }
+
+        private string EnsureBaseTag(string html)
+        {
+            if (_editorBaseUri == null || string.IsNullOrWhiteSpace(html))
+                return html;
+
+            try
+            {
+                var doc = new HtmlAgilityPack.HtmlDocument();
+                doc.LoadHtml(html);
+
+                var htmlNode = doc.DocumentNode.SelectSingleNode("//html");
+                if (htmlNode == null)
+                    return html;
+
+                var head = htmlNode.SelectSingleNode("./head");
+                if (head == null)
+                {
+                    head = doc.CreateElement("head");
+                    htmlNode.PrependChild(head);
+                }
+
+                var baseNode = head.SelectSingleNode("./base[@href]") ?? doc.CreateElement("base");
+                baseNode.SetAttributeValue("href", _editorBaseUri.AbsoluteUri);
+
+                if (baseNode.ParentNode == null)
+                    head.PrependChild(baseNode);
+
+                return doc.DocumentNode.OuterHtml;
+            }
+            catch
+            {
+                return html;
+            }
+        }
+
+        private void HandleResize()
+        {
+            if (_useChromeLayout)
+                return;
+
+            // Resize the webview
+            webView2Control.Size = this.ClientSize - new System.Drawing.Size(webView2Control.Location);
+
+            // Move the Events button
+            btnEvents.Left = this.ClientSize.Width - btnEvents.Width;
+            // Move the Go button
+            btnGo.Left = this.btnEvents.Left - btnGo.Size.Width;
+
+            // Resize the URL textbox
+            txtUrl.Width = btnGo.Left - txtUrl.Left;
+        }
+
+        private Control GetWebViewHost()
+        {
+            if (_useChromeLayout && _previewHostPanel != null)
+                return _previewHostPanel;
+
+            return _useChromeLayout && _contentPanel != null ? _contentPanel : this;
+        }
+
+        private void RemoveWebViewFromHost()
+        {
+            var host = GetWebViewHost();
+            if (webView2Control != null && host.Controls.Contains(webView2Control))
+                host.Controls.Remove(webView2Control);
+        }
+
+        private void AddWebViewToHost()
+        {
+            var host = GetWebViewHost();
+            if (webView2Control != null && !host.Controls.Contains(webView2Control))
+                host.Controls.Add(webView2Control);
+        }
+
+        private void PrepareWebViewControl(WebView2 control)
+        {
+            if (control == null)
+                return;
+
+            if (_useChromeLayout)
+            {
+                control.Dock = DockStyle.Fill;
+                control.Margin = new Padding(0);
+                control.DefaultBackgroundColor = Color.FromArgb(12, 14, 18);
+            }
+            else
+            {
+                control.DefaultBackgroundColor = Color.Transparent;
+            }
+        }
+
+        private void ApplyChromeLayout()
+        {
+            if (_useChromeLayout)
+                return;
+
+            _useChromeLayout = true;
+            SuspendLayout();
+
+            DoubleBuffered = true;
+            BackColor = Color.FromArgb(15, 17, 21);
+            ForeColor = Color.FromArgb(230, 233, 240);
+            Font = new Font("Bahnschrift", 10F, FontStyle.Regular);
+
+            menuStrip1.Dock = DockStyle.Top;
+            menuStrip1.BackColor = Color.FromArgb(18, 21, 28);
+            menuStrip1.ForeColor = Color.FromArgb(223, 228, 236);
+            menuStrip1.Font = new Font("Bahnschrift", 10F, FontStyle.Regular);
+            menuStrip1.Padding = new Padding(10, 3, 0, 3);
+            menuStrip1.Renderer = new ToolStripProfessionalRenderer(new DarkMenuColorTable());
+            ApplyMenuItemStyle(menuStrip1.Items);
+
+            _chromePanel = new GradientPanel
+            {
+                Dock = DockStyle.Top,
+                Height = 92,
+                Padding = new Padding(12, 18, 12, 18),
+                StartColor = Color.FromArgb(27, 32, 43),
+                EndColor = Color.FromArgb(20, 24, 33),
+                Angle = 90,
+                BorderColor = Color.FromArgb(46, 54, 68),
+                BorderThickness = 1
+            };
+
+            _chromeLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                RowCount = 1,
+                BackColor = Color.Transparent,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+            _chromeLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _chromeLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            _chromeLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _chromeLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            _navPanel = new CenteredFlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.Transparent,
+                Anchor = AnchorStyles.Left
+            };
+
+            _actionPanel = new CenteredFlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.Transparent,
+                Anchor = AnchorStyles.Right
+            };
+
+            _addressShell = new GradientPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(18, 22, 32),
+                StartColor = Color.FromArgb(18, 22, 32),
+                EndColor = Color.FromArgb(18, 22, 32),
+                Angle = 0,
+                BorderColor = Color.FromArgb(44, 52, 66),
+                BorderThickness = 1,
+                Padding = new Padding(14, 10, 14, 10),
+                Margin = new Padding(12, 0, 12, 0)
+            };
+
+            _contentPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(12),
+                BackColor = Color.FromArgb(13, 15, 19)
+            };
+
+            _editorSplit = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                SplitterWidth = 6,
+                BackColor = Color.FromArgb(20, 24, 33)
+            };
+            _editorSplit.Panel1.Padding = new Padding(0, 0, 6, 0);
+            _editorSplit.Panel2.Padding = new Padding(6, 0, 0, 0);
+            _editorSplit.Resize += (_, __) => UpdateEditorSplitLayout();
+
+            _htmlEditor = new RichTextBox
+            {
+                Dock = DockStyle.Fill,
+                AcceptsTab = true,
+                WordWrap = false,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 11F, FontStyle.Regular),
+                BackColor = Color.FromArgb(14, 17, 24),
+                ForeColor = Color.FromArgb(232, 236, 244),
+                ScrollBars = RichTextBoxScrollBars.Both
+            };
+            _htmlEditor.TextChanged += htmlEditor_TextChanged;
+
+            _previewHostPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(12, 14, 18)
+            };
+
+            _openHtmlButton = new Button
+            {
+                Text = "Open HTML"
+            };
+            _openHtmlButton.Click += openHtmlButton_Click;
+
+            _formatHtmlButton = new Button
+            {
+                Text = "Format"
+            };
+            _formatHtmlButton.Click += formatHtmlButton_Click;
+
+            _editorPreviewTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 350
+            };
+            _editorPreviewTimer.Tick += editorPreviewTimer_Tick;
+
+            ApplyButtonStyle(btnBack);
+            ApplyButtonStyle(btnForward);
+            ApplyButtonStyle(btnRefresh);
+            ApplyButtonStyle(btnStop);
+            ApplyButtonStyle(btnGo, Color.FromArgb(59, 130, 246));
+            ApplyButtonStyle(_openHtmlButton, Color.FromArgb(251, 146, 60));
+            ApplyButtonStyle(_formatHtmlButton, Color.FromArgb(14, 165, 233));
+            ApplyButtonStyle(linksBtn, Color.FromArgb(99, 102, 241));
+            ApplyButtonStyle(ScrapeBtn, Color.FromArgb(16, 185, 129));
+            ApplyButtonStyle(btnEvents);
+
+            btnBack.Margin = new Padding(0, 0, 8, 0);
+            btnForward.Margin = new Padding(0, 0, 8, 0);
+            btnRefresh.Margin = new Padding(0, 0, 8, 0);
+            btnStop.Margin = new Padding(0, 0, 8, 0);
+            btnGo.Margin = new Padding(0);
+            _openHtmlButton.Margin = new Padding(0, 0, 8, 0);
+            _formatHtmlButton.Margin = new Padding(0, 0, 8, 0);
+            linksBtn.Margin = new Padding(0, 0, 8, 0);
+            ScrapeBtn.Margin = new Padding(0, 0, 8, 0);
+
+            SetButtonWidth(btnBack, 92);
+            SetButtonWidth(btnForward, 104);
+            SetButtonWidth(btnRefresh, 96);
+            SetButtonWidth(btnStop, 96);
+            SetButtonWidth(_openHtmlButton, 126);
+            SetButtonWidth(_formatHtmlButton, 108);
+            SetButtonWidth(linksBtn, 100);
+            SetButtonWidth(ScrapeBtn, 112);
+
+            txtUrl.BorderStyle = BorderStyle.None;
+            txtUrl.AutoSize = false;
+            txtUrl.BackColor = _addressShell.BackColor;
+            txtUrl.ForeColor = Color.FromArgb(233, 237, 244);
+            txtUrl.Font = new Font("Bahnschrift", 14F, FontStyle.Regular);
+            txtUrl.MinimumSize = new Size(160, 38);
+            txtUrl.Height = 38;
+            txtUrl.Margin = new Padding(0);
+            txtUrl.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+            txtUrl.KeyDown += txtUrl_KeyDown;
+
+            btnGo.Dock = DockStyle.Right;
+            btnGo.AutoSize = false;
+            btnGo.Width = 92;
+            btnGo.Height = 40;
+            btnGo.TextAlign = ContentAlignment.MiddleCenter;
+            btnGo.Text = "Go";
+            btnGo.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+
+            linksBtn.Text = "Links";
+            ScrapeBtn.Text = "Scrape";
+
+            _navPanel.Controls.Add(btnBack);
+            _navPanel.Controls.Add(btnForward);
+            _navPanel.Controls.Add(btnRefresh);
+            _navPanel.Controls.Add(btnStop);
+
+            _actionPanel.Controls.Add(_openHtmlButton);
+            _actionPanel.Controls.Add(_formatHtmlButton);
+            _actionPanel.Controls.Add(linksBtn);
+            _actionPanel.Controls.Add(ScrapeBtn);
+            _actionPanel.Controls.Add(btnEvents);
+
+            _addressShell.Controls.Add(txtUrl);
+            _addressShell.Controls.Add(btnGo);
+            _addressShell.Resize += (_, __) => LayoutAddressBar();
+
+            _chromeLayout.Controls.Add(_navPanel, 0, 0);
+            _chromeLayout.Controls.Add(_addressShell, 1, 0);
+            _chromeLayout.Controls.Add(_actionPanel, 2, 0);
+            _chromePanel.Controls.Add(_chromeLayout);
+
+            PrepareWebViewControl(webView2Control);
+
+            _editorSplit.Panel1.Controls.Add(_htmlEditor);
+            _editorSplit.Panel2.Controls.Add(_previewHostPanel);
+            _previewHostPanel.Controls.Add(webView2Control);
+            _contentPanel.Controls.Add(_editorSplit);
+
+            Controls.Add(_contentPanel);
+            Controls.Add(_chromePanel);
+
+            Controls.SetChildIndex(menuStrip1, 0);
+            Controls.SetChildIndex(_chromePanel, 1);
+            Controls.SetChildIndex(_contentPanel, 2);
+
+            ResumeLayout(true);
+            LayoutAddressBar();
+            UpdateEditorSplitLayout();
+            SetEditorText("<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\" />\n  <title>New Document</title>\n</head>\n<body>\n  <h1>Edit HTML on the left</h1>\n  <p>Preview updates live on the right.</p>\n</body>\n</html>", formatHtml: true);
+        }
+
+        private void ApplyButtonStyle(Button button, Color? accentColor = null)
+        {
+            if (button == null)
+                return;
+
+            var baseColor = accentColor ?? Color.FromArgb(28, 34, 48);
+            var hoverColor = ControlPaint.Light(baseColor, 0.15f);
+            var downColor = ControlPaint.Dark(baseColor, 0.1f);
+
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 0;
+            button.FlatAppearance.MouseOverBackColor = hoverColor;
+            button.FlatAppearance.MouseDownBackColor = downColor;
+            button.BackColor = baseColor;
+            button.ForeColor = Color.FromArgb(238, 242, 247);
+            button.Font = new Font("Bahnschrift", 12F, FontStyle.Bold);
+            button.AutoSize = false;
+            button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            button.Padding = new Padding(12, 4, 12, 4);
+            button.Height = 40;
+            button.MinimumSize = new Size(88, 40);
+            button.UseVisualStyleBackColor = false;
+        }
+
+        private void SetButtonWidth(Button button, int width)
+        {
+            if (button == null)
+                return;
+            button.Width = width;
+        }
+
+        private void LayoutAddressBar()
+        {
+            if (!_useChromeLayout || _addressShell == null)
+                return;
+
+            int goWidth = btnGo.Width;
+            int goHeight = btnGo.Height;
+            int gap = 8;
+
+            var padding = _addressShell.Padding;
+            var inner = new Rectangle(
+                padding.Left,
+                padding.Top,
+                Math.Max(0, _addressShell.ClientSize.Width - padding.Left - padding.Right),
+                Math.Max(0, _addressShell.ClientSize.Height - padding.Top - padding.Bottom)
+            );
+            int centerY = inner.Top + (inner.Height - goHeight) / 2;
+
+            btnGo.Location = new Point(inner.Right - goWidth, centerY);
+
+            int textHeight = txtUrl.Height;
+            int textY = inner.Top + (inner.Height - textHeight) / 2;
+            txtUrl.Location = new Point(inner.Left, textY);
+            txtUrl.Width = Math.Max(120, btnGo.Left - gap - txtUrl.Left);
+        }
+
+        private void UpdateEditorSplitLayout()
+        {
+            if (_editorSplit == null || _editorSplit.IsDisposed)
+                return;
+
+            int width = _editorSplit.ClientSize.Width;
+            if (width <= 0)
+                return;
+
+            int available = Math.Max(0, width - _editorSplit.SplitterWidth);
+            int half = available / 2;
+            int minPane = Math.Min(260, half);
+            if (minPane < 80)
+                minPane = half;
+
+            int desiredDistance = half;
+            int minDistance = minPane;
+            int maxDistance = Math.Max(minDistance, available - minPane);
+            int clampedDistance = Math.Clamp(desiredDistance, minDistance, maxDistance);
+
+            _editorSplit.Panel1MinSize = 0;
+            _editorSplit.Panel2MinSize = 0;
+            _editorSplit.SplitterDistance = clampedDistance;
+            _editorSplit.Panel1MinSize = minPane;
+            _editorSplit.Panel2MinSize = minPane;
+        }
+
+        private void ApplyMenuItemStyle(ToolStripItemCollection items)
+        {
+            foreach (ToolStripItem item in items)
+            {
+                item.ForeColor = menuStrip1.ForeColor;
+                if (item is ToolStripMenuItem menuItem && menuItem.DropDownItems.Count > 0)
+                    ApplyMenuItemStyle(menuItem.DropDownItems);
+            }
+        }
+
+        private sealed class DarkMenuColorTable : ProfessionalColorTable
+        {
+            public override Color ToolStripDropDownBackground => Color.FromArgb(17, 20, 26);
+            public override Color ImageMarginGradientBegin => Color.FromArgb(17, 20, 26);
+            public override Color ImageMarginGradientMiddle => Color.FromArgb(17, 20, 26);
+            public override Color ImageMarginGradientEnd => Color.FromArgb(17, 20, 26);
+            public override Color MenuBorder => Color.FromArgb(46, 54, 68);
+            public override Color MenuItemBorder => Color.FromArgb(58, 66, 82);
+            public override Color MenuItemSelected => Color.FromArgb(40, 46, 60);
+            public override Color MenuItemSelectedGradientBegin => Color.FromArgb(40, 46, 60);
+            public override Color MenuItemSelectedGradientEnd => Color.FromArgb(40, 46, 60);
+            public override Color MenuItemPressedGradientBegin => Color.FromArgb(33, 38, 50);
+            public override Color MenuItemPressedGradientMiddle => Color.FromArgb(33, 38, 50);
+            public override Color MenuItemPressedGradientEnd => Color.FromArgb(33, 38, 50);
+            public override Color SeparatorDark => Color.FromArgb(34, 39, 50);
+            public override Color SeparatorLight => Color.FromArgb(34, 39, 50);
+            public override Color ToolStripBorder => Color.FromArgb(34, 39, 50);
+            public override Color ToolStripGradientBegin => Color.FromArgb(18, 21, 28);
+            public override Color ToolStripGradientMiddle => Color.FromArgb(18, 21, 28);
+            public override Color ToolStripGradientEnd => Color.FromArgb(18, 21, 28);
+        }
+
+        private sealed class GradientPanel : Panel
+        {
+            public Color StartColor { get; set; } = Color.FromArgb(27, 32, 43);
+            public Color EndColor { get; set; } = Color.FromArgb(20, 24, 33);
+            public float Angle { get; set; } = 90F;
+            public Color BorderColor { get; set; } = Color.FromArgb(46, 54, 68);
+            public int BorderThickness { get; set; } = 1;
+
+            public GradientPanel()
+            {
+                DoubleBuffered = true;
+                ResizeRedraw = true;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                using var brush = new LinearGradientBrush(ClientRectangle, StartColor, EndColor, Angle);
+                e.Graphics.FillRectangle(brush, ClientRectangle);
+
+                if (BorderThickness > 0)
+                {
+                    using var pen = new Pen(BorderColor, BorderThickness);
+                    var rect = new Rectangle(0, 0, Width - 1, Height - 1);
+                    e.Graphics.DrawRectangle(pen, rect);
+                }
+            }
+        }
+
+        private sealed class CenteredFlowLayoutPanel : FlowLayoutPanel
+        {
+            public CenteredFlowLayoutPanel()
+            {
+                DoubleBuffered = true;
+            }
+
+            protected override void OnLayout(LayoutEventArgs levent)
+            {
+                base.OnLayout(levent);
+
+                int available = ClientSize.Height;
+                if (available <= 0)
+                    return;
+
+                foreach (Control control in Controls)
+                {
+                    if (!control.Visible)
+                        continue;
+                    int centeredTop = Math.Max(0, (available - control.Height) / 2);
+                    control.Top = centeredTop;
+                }
+            }
+        }
+
+        private string GetSdkBuildVersion()
+        {
+            CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions();
+
+            // The full version string A.B.C.D
+            var targetVersionMajorAndRest = options.TargetCompatibleBrowserVersion;
+            var versionList = targetVersionMajorAndRest.Split('.');
+            if (versionList.Length != 4)
+            {
+                return "Invalid SDK build version";
+            }
+            // Keep C.D
+            return versionList[2] + "." + versionList[3];
+        }
+
+        private string GetRuntimeVersion(CoreWebView2 webView2)
+        {
+            return webView2.Environment.BrowserVersionString;
+        }
+
+        private string GetAppPath()
+        {
+            return System.AppDomain.CurrentDomain.SetupInformation.ApplicationBase;
+        }
+
+        private string GetRuntimePath(CoreWebView2 webView2)
+        {
+            int processId = (int)webView2.BrowserProcessId;
+            try
+            {
+                Process process = System.Diagnostics.Process.GetProcessById(processId);
+                var fileName = process.MainModule.FileName;
+                return System.IO.Path.GetDirectoryName(fileName);
+            }
+            catch (ArgumentException e)
+            {
+                return e.Message;
+            }
+            catch (InvalidOperationException e)
+            {
+                return e.Message;
+            }
+            // Occurred when a 32-bit process wants to access the modules of a 64-bit process.
+            catch (Win32Exception e)
+            {
+                return e.Message;
+            }
+        }
+
+        private string GetStartPageUri(CoreWebView2 webView2)
+        {
+            string uri = "http://google.com";
+            if (webView2 == null)
+            {
+                return uri;
+            }
+            string sdkBuildVersion = GetSdkBuildVersion(),
+                   runtimeVersion = GetRuntimeVersion(webView2),
+                   appPath = GetAppPath(),
+                   runtimePath = GetRuntimePath(webView2);
+            string newUri = $"{uri}";
+            return newUri;
+        }
+        private Task WaitForNavigationAsync()
+        {
+            var core = webView2Control.CoreWebView2;
+            if (core == null)
+                return Task.CompletedTask;
+
+            var tcs = new TaskCompletionSource<bool>();
+
+            void Handler(object? sender, CoreWebView2NavigationCompletedEventArgs e)
+            {
+                core.NavigationCompleted -= Handler;
+                tcs.TrySetResult(true);
+            }
+
+            core.NavigationCompleted += Handler;
+            return tcs.Task;
+        }
+
+        private async Task<string> GetPageHtmlAsync()
+        {
+            var core = webView2Control.CoreWebView2;
+            if (core == null)
+                return string.Empty;
+
+            string js = "document.documentElement.outerHTML";
+            string raw = await core.ExecuteScriptAsync(js);
+            return JsonSerializer.Deserialize<string>(raw) ?? string.Empty;
+        }
+
+        private (List<string> links, string? nextUrl) ExtractLinksAndNext(string html, string currentUrl)
+        {
+            var baseUri = new Uri(currentUrl);
+
+            var doc = new HtmlAgilityPack.HtmlDocument();
+            doc.LoadHtml(html);
+
+            var links = new List<string>();
+
+            var aNodes = doc.DocumentNode.SelectNodes("//article//a[@href]");
+            if (aNodes != null)
+            {
+                foreach (var a in aNodes)
+                {
+                    var href = a.GetAttributeValue("href", null);
+                    if (string.IsNullOrWhiteSpace(href))
+                        continue;
+
+                    if (!href.Contains("/oferta/"))
+                        continue;
+
+                    href = WebUtility.HtmlDecode(href);
+
+                    var absolute = href.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                        ? href
+                        : new Uri(baseUri, href).ToString();   // << use baseUri here
+
+                    links.Add(absolute);
+                }
+            }
+
+            // NEXT page
+            var nextNode = doc.DocumentNode.SelectSingleNode(
+                "//a[@rel='next' and not(contains(@class,'disabled'))]"
+            );
+
+            string? nextUrl = null;
+            if (nextNode != null)
+            {
+                var href = nextNode.GetAttributeValue("href", null);
+                if (!string.IsNullOrWhiteSpace(href))
+                {
+                    href = WebUtility.HtmlDecode(href);
+                    nextUrl = href.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                        ? href
+                        : new Uri(baseUri, href).ToString();   // same pattern
+                }
+            }
+
+            return (links.Distinct().ToList(), nextUrl);
+        }
+
+
+        private async Task<int> SaveProductLinksAsync(IEnumerable<string> urls)
+        {
+            using var db = new BrowserDbContext();
+            int added = 0;
+
+            foreach (var url in urls.Distinct())
+            {
+                bool exists = await db.ProductLinks.AnyAsync(p => p.Url == url);
+                if (exists) continue;
+
+                db.ProductLinks.Add(new ProductLink
+                {
+                    Url = url,
+                    Status = "pending",
+                    LastError = null
+                });
+                added++;
+            }
+
+            await db.SaveChangesAsync();
+            return added;
+        }
+        private async Task CollectCategoryLinksAsync()
+        {
+            if (webView2Control.CoreWebView2 == null)
+            {
+                MessageBox.Show("WebView is not initialized yet. Wait for the page to load.");
+                return;
+            }
+
+            // start from current URL (category page)
+            string startUrl = webView2Control.Source?.AbsoluteUri ?? txtUrl.Text;
+            if (string.IsNullOrWhiteSpace(startUrl))
+            {
+                MessageBox.Show("No current URL.");
+                return;
+            }
+
+            string currentUrl = startUrl;
+            int totalAdded = 0;
+            Cursor oldCursor = this.Cursor;
+            this.Cursor = Cursors.WaitCursor;
+
+            try
+            {
+                while (!string.IsNullOrEmpty(currentUrl))
+                {
+                    webView2Control.CoreWebView2.Navigate(currentUrl);
+                    await WaitForNavigationAsync();
+
+                    string html = await GetPageHtmlAsync();
+
+                    var (links, nextUrl) = ExtractLinksAndNext(html, currentUrl);
+
+                    int added = await SaveProductLinksAsync(links);
+                    totalAdded += added;
+
+                    currentUrl = nextUrl;
+                }
+
+                MessageBox.Show($"Finished. Added {totalAdded} new product links.");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Error while collecting links:\n" + ex.Message);
+            }
+            finally
+            {
+                this.Cursor = oldCursor;
+            }
+        }
+
+        async private void linksBtn_Click(object sender, EventArgs e)
+        {
+            await CollectCategoryLinksAsync();
+        }
+
+        async private void ScrapeBtn_Click(object sender, EventArgs e)
+        {
+            await ScrapePendingProductsAsync();
+        }
+        private class ProductScrapeResult
+        {
+            public string Title { get; set; }
+            public string PriceText { get; set; }
+            public string Description { get; set; }
+            public string[] ImageUrls { get; set; }
+            public Dictionary<string, string> Specifications { get; set; }
+            public string Url { get; set; }
+        }
+
+        private async Task<bool> ScrapeOneProductAsync(ProductLink link)
+        {
+            if (webView2Control.CoreWebView2 == null)
+                throw new InvalidOperationException("WebView2 not initialized.");
+
+            // 1. Navigate to product page
+            webView2Control.CoreWebView2.Navigate(link.Url);
+            await WaitForNavigationAsync();
+
+            const string expandParamsScript = @"
+    (function() {
+        var candidates = Array.from(document.querySelectorAll('button, a, span'))
+            .filter(function(el) {
+                var t = (el.innerText || '').toLowerCase();
+                return t.includes('pełne parametry') ||
+                       t.includes('wszystkie parametry') ||
+                       t.includes('więcej parametrów') ||
+                       t.includes('pokaż więcej') &&
+                       t.includes('parametr');
+            });
+
+        candidates.forEach(function(el) {
+            try { el.click(); } catch (e) {}
+        });
+    })();
+";
+
+            // click the buttons
+            await webView2Control.CoreWebView2.ExecuteScriptAsync(expandParamsScript);
+
+            // give the page a bit of time to load extra rows / update DOM
+            await Task.Delay(1000);
+
+
+            // 2. JavaScript to extract data from Allegro offer page
+            const string script = @"
+(function() {
+    function textOrNull(el) {
+        return el ? el.innerText.trim() : null;
+    }
+    function text(el) {
+        return el ? el.innerText.trim() : '';
+    }
+
+    // ----- title & price -----
+    var titleEl = document.querySelector('h1');
+    var priceEl = document.querySelector('[data-role=""price""]') ||
+                  document.querySelector('meta[itemprop=""price""]');
+
+    var descEl = document.querySelector('[data-box-name=""Description""]') ||
+                 document.querySelector('#description');
+
+    // ----- images -----
+    var imgEls = Array.from(document.querySelectorAll('img'));
+    var imgSrcs = imgEls
+        .map(function(img) { return img.src; })
+        .filter(function(src) { return src && src.startsWith('http'); });
+    var uniqueImgs = Array.from(new Set(imgSrcs));
+
+    // ----- parameters (page + modal) -----
+    var specs = {};
+
+    function collectFromRoot(root) {
+        if (!root) return;
+        var rows = root.querySelectorAll('tr');
+        rows.forEach(function(row) {
+            var cells = row.querySelectorAll('th,td');
+            if (cells.length !== 2) return;
+
+            var name = text(cells[0]);
+            var val  = text(cells[1]);
+
+            if (!name || !val) return;
+            if (name.length > 120 || val.length > 800) return;
+
+            specs[name] = val;
+        });
+    }
+
+    var roots = [];
+
+    // main parameters box
+    var mainBox = document.querySelector('[data-box-name=""Parameters""]');
+    if (mainBox) roots.push(mainBox);
+
+    // any dialog/modal that looks like the big parameters panel
+    document.querySelectorAll('div[role=""dialog""]').forEach(function(d) {
+        var header = d.querySelector('h1,h2,h3');
+        if (header && /parametr/i.test(header.innerText)) {
+            roots.push(d);
+        }
+    });
+
+    // sections with aria-label mentioning parameters
+    document.querySelectorAll('section[aria-label]').forEach(function(s) {
+        var label = s.getAttribute('aria-label') || '';
+        if (/parametr/i.test(label)) {
+            roots.push(s);
+        }
+    });
+
+    // fallback: some Allegro layouts use data-testid
+    if (roots.length === 0) {
+        var panel = document.querySelector('[data-testid=""parameters-section""]');
+        if (panel) roots.push(panel);
+    }
+
+    // ultimate fallback: whole document (won't hurt)
+    if (roots.length === 0) {
+        roots.push(document.body);
+    }
+
+    roots.forEach(collectFromRoot);
+
+    return {
+        Title:        textOrNull(titleEl),
+        PriceText:    priceEl ? (priceEl.content || priceEl.innerText.trim()) : null,
+        Description:  textOrNull(descEl),
+        ImageUrls:    uniqueImgs,
+        Specifications: specs,
+        Url:          location.href
+    };
+})();
+";
+
+
+            string json = await webView2Control.CoreWebView2.ExecuteScriptAsync(script);
+
+            var result = JsonSerializer.Deserialize<ProductScrapeResult>(
+                json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
+            );
+
+            if (result == null)
+                throw new Exception("Could not deserialize product data.");
+
+            // 3. Save to DB
+            using var db = new BrowserDbContext();
+
+            // attach the link so we can update its status
+            var dbLink = await db.ProductLinks.FirstAsync(p => p.Id == link.Id);
+
+            var product = await db.Products
+                .FirstOrDefaultAsync(p => p.Url == link.Url);
+
+            if (product == null)
+            {
+                product = new ProductInfo
+                {
+                    Url = link.Url
+                };
+                db.Products.Add(product);
+            }
+
+            product.Title = result.Title ?? product.Title;
+            product.Description = result.Description ?? product.Description;
+
+            // put price into Specifications as well
+            var specs = result.Specifications ?? new Dictionary<string, string>();
+            if (!string.IsNullOrWhiteSpace(result.PriceText))
+                specs["Cena"] = result.PriceText;
+
+            product.Specifications = specs;
+            product.ImageUrls = result.ImageUrls?.ToList() ?? new List<string>();
+            product.ScrapedAt = DateTime.UtcNow;
+
+            dbLink.Status = "scraped";
+            dbLink.LastError = null;
+
+            await db.SaveChangesAsync();
+            return true;
+        }
+        private static readonly TimeSpan MinDelay = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan Jitter = TimeSpan.FromSeconds(20);
+        private async Task ScrapePendingProductsAsync(int maxCount = 0)
+        {
+            Cursor oldCursor = this.Cursor;
+            this.Cursor = Cursors.WaitCursor;
+
+            int scraped = 0;
+            int failed = 0;
+            var rnd = new Random();
+
+            try
+            {
+                while (true)
+                {
+                    using var db = new BrowserDbContext();
+
+                    var next = await db.ProductLinks
+                        .Where(p => p.Status == "pending")
+                        .OrderBy(p => p.Id)
+                        .FirstOrDefaultAsync();
+
+                    if (next == null)
+                        break; // nothing left
+
+                    // detach before passing to another context
+                    var linkCopy = new ProductLink
+                    {
+                        Id = next.Id,
+                        Url = next.Url,
+                        Status = next.Status,
+                        LastError = next.LastError
+                    };
+
+                    try
+                    {
+                        await ScrapeOneProductAsync(linkCopy);
+                        scraped++;
+                    }
+                    catch (Exception ex)
+                    {
+                        using var db2 = new BrowserDbContext();
+                        var dbLink = await db2.ProductLinks.FirstAsync(p => p.Id == linkCopy.Id);
+                        dbLink.Status = "failed";
+                        dbLink.LastError = ex.Message;
+                        await db2.SaveChangesAsync();
+                        failed++;
+                    }
+
+                    if (maxCount > 0 && scraped + failed >= maxCount)
+                        break;
+
+                    var jitterSeconds = rnd.NextDouble() * Jitter.TotalSeconds;
+                    var delay = MinDelay + TimeSpan.FromSeconds(jitterSeconds);
+                    await Task.Delay(delay);
+                }
+
+                MessageBox.Show($"Scraping finished.\nScraped: {scraped}\nFailed: {failed}");
+            }
+            finally
+            {
+                this.Cursor = oldCursor;
+            }
+        }
+
+        private static readonly HttpClient _httpClient = new HttpClient();
+
+        // choose some key for folder name: Allegro numeric id if present, else link.Id
+        private static string GetProductKey(ProductLink link)
+        {
+            var m = Regex.Match(link.Url, @"(\d+)(?:\?|$)");
+            if (m.Success) return m.Groups[1].Value;
+            return link.Id.ToString();
+        }
+        private static string GetProductKey(ProductInfo product)
+        {
+            var url = product.Url ?? "";
+            var m = Regex.Match(url, @"(\d+)(?:\?|$)");
+            if (m.Success) return m.Groups[1].Value;
+            return product.Id.ToString();
+        }
+        private static string SanitizeFileName(string name)
+        {
+            foreach (var c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
+
+        private async Task<List<string>> DownloadImagesAsync(IEnumerable<string> urls, string productKey)
+        {
+            var localPaths = new List<string>();
+            if (urls == null) return localPaths;
+
+            var baseDir = Path.Combine(AppContext.BaseDirectory, "images");
+            Directory.CreateDirectory(baseDir);
+
+            var productDirName = SanitizeFileName(productKey);
+            var productDir = Path.Combine(baseDir, productDirName);
+            Directory.CreateDirectory(productDir);
+
+            int index = 0;
+            foreach (var url in urls.Distinct())
+            {
+                if (string.IsNullOrWhiteSpace(url))
+                    continue;
+
+                try
+                {
+                    var uri = new Uri(url);
+                    var ext = Path.GetExtension(uri.AbsolutePath);
+                    if (string.IsNullOrEmpty(ext) || ext.Length > 5)
+                        ext = ".jpg";
+
+                    var fileName = $"img_{index++}{ext}";
+                    var filePath = Path.Combine(productDir, fileName);
+
+                    if (!File.Exists(filePath))
+                    {
+                        using var resp = await _httpClient.GetAsync(uri);
+                        resp.EnsureSuccessStatusCode();
+
+                        await using var fs = File.Create(filePath);
+                        await resp.Content.CopyToAsync(fs);
+                    }
+
+                    localPaths.Add(filePath);
+                }
+                catch
+                {
+                    // ignore single-image failures, continue with others
+                }
+            }
+
+            return localPaths;
+        }
+
+        private async Task DownloadImagesForScrapedProductsAsync()
+        {
+            Cursor oldCursor = this.Cursor;
+            this.Cursor = Cursors.WaitCursor;
+
+            int productsProcessed = 0;
+
+            try
+            {
+                using var db = new BrowserDbContext();
+
+                // Only products that have been scraped but have no local images yet
+                var products = await db.Products
+                    .Where(p => p.ScrapedAt != null &&
+                                (p.ImagePathsJson == null || p.ImagePathsJson == ""))
+                    .OrderBy(p => p.Id)
+                    .ToListAsync();
+
+                foreach (var product in products)
+                {
+                    var urls = product.ImageUrls; // comes from Specs scraper
+                    if (urls == null || urls.Count == 0)
+                        continue;
+
+                    var key = GetProductKey(product);
+                    var localPaths = await DownloadImagesAsync(urls, key);
+                    product.ImagePaths = localPaths;
+                    productsProcessed++;
+                }
+
+                await db.SaveChangesAsync();
+
+                MessageBox.Show($"Downloaded images for {productsProcessed} products.");
+            }
+            finally
+            {
+                this.Cursor = oldCursor;
+            }
+        }
+
+
+    }
+}
