@@ -39,9 +39,11 @@ namespace WebView2WindowsFormsBrowser
         private Panel _addressShell;
         private SplitContainer _editorSplit;
         private SplitContainer _designPreviewSplit;
+        private Panel _editorSourcePanel;
         private Panel _previewHostPanel;
         private Panel _visualEditorHostPanel;
         private RichTextBox _htmlEditor;
+        private RichTextBox _lineNumberGutter;
         private WebView2 _visualEditorWebView;
         private Button _lightThemeButton;
         private Button _darkThemeButton;
@@ -63,6 +65,7 @@ namespace WebView2WindowsFormsBrowser
         private bool _syncEditorFromNavigation;
         private string _pendingVisualEditorHtml = string.Empty;
         private Uri _editorBaseUri;
+        private int _lineNumberCount = -1;
         private const int SyntaxHighlightMaxChars = 14000;
         private const int SyntaxHighlightViewportPadding = 3000;
         private const int SyntaxTypingViewportThresholdChars = 8000;
@@ -1788,6 +1791,8 @@ namespace WebView2WindowsFormsBrowser
 
         private void htmlEditor_TextChanged(object sender, EventArgs e)
         {
+            UpdateLineNumberGutter();
+
             if (_suppressEditorTextChanged || _isApplyingSyntaxHighlight || _editorPreviewTimer == null)
                 return;
 
@@ -1806,12 +1811,74 @@ namespace WebView2WindowsFormsBrowser
 
         private void htmlEditor_VScroll(object sender, EventArgs e)
         {
+            SyncLineNumberGutterScroll();
             QueueViewportSyntaxHighlight();
         }
 
         private void htmlEditor_HScroll(object sender, EventArgs e)
         {
+            SyncLineNumberGutterScroll();
             QueueViewportSyntaxHighlight();
+        }
+
+        private void htmlEditor_MouseWheel(object sender, MouseEventArgs e)
+        {
+            SyncLineNumberGutterScroll();
+            QueueViewportSyntaxHighlight();
+        }
+
+        private void htmlEditor_Resize(object sender, EventArgs e)
+        {
+            SyncLineNumberGutterScroll();
+        }
+
+        private void UpdateLineNumberGutter(bool forceTextRebuild = false)
+        {
+            if (_htmlEditor == null || _lineNumberGutter == null)
+                return;
+
+            int lineCount = Math.Max(1, _htmlEditor.GetLineFromCharIndex(_htmlEditor.TextLength) + 1);
+            UpdateLineNumberGutterWidth(lineCount);
+
+            if (forceTextRebuild || lineCount != _lineNumberCount)
+            {
+                int digits = Math.Max(2, lineCount.ToString().Length);
+                var builder = new StringBuilder(lineCount * (digits + 1));
+                for (int i = 1; i <= lineCount; i++)
+                {
+                    builder.Append(i.ToString().PadLeft(digits));
+                    if (i < lineCount)
+                        builder.Append('\n');
+                }
+
+                _lineNumberCount = lineCount;
+                _lineNumberGutter.Text = builder.ToString();
+            }
+
+            SyncLineNumberGutterScroll();
+        }
+
+        private void UpdateLineNumberGutterWidth(int lineCount)
+        {
+            if (_lineNumberGutter == null)
+                return;
+
+            int digits = Math.Max(2, lineCount.ToString().Length);
+            int measuredWidth = TextRenderer.MeasureText(new string('9', digits), _lineNumberGutter.Font).Width + 14;
+            int targetWidth = Math.Max(40, measuredWidth);
+            if (_lineNumberGutter.Width != targetWidth)
+                _lineNumberGutter.Width = targetWidth;
+        }
+
+        private void SyncLineNumberGutterScroll()
+        {
+            if (_htmlEditor == null || _lineNumberGutter == null)
+                return;
+
+            Point editorScroll = GetRichTextScrollPosition(_htmlEditor);
+            Point gutterScroll = GetRichTextScrollPosition(_lineNumberGutter);
+            if (gutterScroll.Y != editorScroll.Y)
+                SetRichTextScrollPosition(_lineNumberGutter, new Point(0, editorScroll.Y));
         }
 
         private void QueueEditorSyntaxHighlight(bool viewportOnly = false)
@@ -1917,6 +1984,7 @@ namespace WebView2WindowsFormsBrowser
                 _htmlEditor.SelectionLength = 0;
             }
             _suppressEditorTextChanged = false;
+            UpdateLineNumberGutter();
 
             if (applySyntaxHighlight)
                 ApplyHtmlSyntaxHighlight();
@@ -2642,6 +2710,7 @@ namespace WebView2WindowsFormsBrowser
             // Select first, then restore scroll. Selecting can auto-scroll caret into view.
             _htmlEditor.Select(safeStart, safeLength);
             SetRichTextScrollPosition(_htmlEditor, scrollPos);
+            SyncLineNumberGutterScroll();
         }
 
         private void ApplyRegexColor(Regex pattern, string text, int offset, Color color)
@@ -3506,13 +3575,20 @@ namespace WebView2WindowsFormsBrowser
             _designPreviewSplit.Panel2.Padding = new Padding(3, 0, 0, 0);
             _designPreviewSplit.Resize += (_, __) => UpdateEditorSplitLayout();
 
+            _editorSourcePanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(1),
+                BackColor = Color.FromArgb(44, 52, 66)
+            };
+
             _htmlEditor = new RichTextBox
             {
                 Dock = DockStyle.Fill,
                 AcceptsTab = true,
                 WordWrap = false,
                 DetectUrls = false,
-                BorderStyle = BorderStyle.FixedSingle,
+                BorderStyle = BorderStyle.None,
                 Font = new Font("Consolas", 11F, FontStyle.Regular),
                 BackColor = Color.FromArgb(14, 17, 24),
                 ForeColor = EditorBaseColor,
@@ -3521,6 +3597,27 @@ namespace WebView2WindowsFormsBrowser
             _htmlEditor.TextChanged += htmlEditor_TextChanged;
             _htmlEditor.VScroll += htmlEditor_VScroll;
             _htmlEditor.HScroll += htmlEditor_HScroll;
+            _htmlEditor.MouseWheel += htmlEditor_MouseWheel;
+            _htmlEditor.Resize += htmlEditor_Resize;
+
+            _lineNumberGutter = new RichTextBox
+            {
+                Dock = DockStyle.Left,
+                Width = 48,
+                ReadOnly = true,
+                TabStop = false,
+                WordWrap = false,
+                DetectUrls = false,
+                ShortcutsEnabled = false,
+                Multiline = true,
+                BorderStyle = BorderStyle.None,
+                ScrollBars = RichTextBoxScrollBars.None,
+                Font = new Font("Consolas", 11F, FontStyle.Regular),
+                BackColor = Color.FromArgb(18, 22, 32),
+                ForeColor = Color.FromArgb(124, 140, 163),
+                Cursor = Cursors.Arrow
+            };
+            _lineNumberGutter.GotFocus += (_, __) => _htmlEditor?.Focus();
 
             _previewHostPanel = new Panel
             {
@@ -3680,7 +3777,9 @@ namespace WebView2WindowsFormsBrowser
 
             PrepareWebViewControl(webView2Control);
 
-            _editorSplit.Panel1.Controls.Add(_htmlEditor);
+            _editorSourcePanel.Controls.Add(_htmlEditor);
+            _editorSourcePanel.Controls.Add(_lineNumberGutter);
+            _editorSplit.Panel1.Controls.Add(_editorSourcePanel);
             _editorSplit.Panel2.Controls.Add(_designPreviewSplit);
             _designPreviewSplit.Panel1.Controls.Add(_visualEditorHostPanel);
             _designPreviewSplit.Panel2.Controls.Add(_previewHostPanel);
@@ -3752,6 +3851,9 @@ namespace WebView2WindowsFormsBrowser
             if (_editorSplit != null)
                 _editorSplit.BackColor = isDark ? Color.FromArgb(20, 24, 33) : Color.FromArgb(214, 225, 242);
 
+            if (_editorSourcePanel != null)
+                _editorSourcePanel.BackColor = isDark ? Color.FromArgb(44, 52, 66) : Color.FromArgb(182, 194, 214);
+
             if (_designPreviewSplit != null)
                 _designPreviewSplit.BackColor = isDark ? Color.FromArgb(18, 22, 32) : Color.FromArgb(214, 225, 242);
 
@@ -3767,6 +3869,12 @@ namespace WebView2WindowsFormsBrowser
                 _htmlEditor.ForeColor = GetEditorBaseSyntaxColor();
             }
 
+            if (_lineNumberGutter != null)
+            {
+                _lineNumberGutter.BackColor = isDark ? Color.FromArgb(18, 22, 32) : Color.FromArgb(245, 248, 253);
+                _lineNumberGutter.ForeColor = isDark ? Color.FromArgb(124, 140, 163) : Color.FromArgb(100, 116, 139);
+            }
+
             txtUrl.BackColor = isDark ? Color.FromArgb(18, 22, 32) : Color.FromArgb(255, 255, 255);
             txtUrl.ForeColor = isDark ? Color.FromArgb(233, 237, 244) : Color.FromArgb(32, 44, 63);
 
@@ -3778,6 +3886,7 @@ namespace WebView2WindowsFormsBrowser
 
             ApplyCommandButtonStyles();
             ApplyHtmlSyntaxHighlight();
+            UpdateLineNumberGutter(forceTextRebuild: true);
         }
 
         private void ApplyCommandButtonStyles()
