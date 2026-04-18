@@ -51,6 +51,7 @@ namespace WebView2WindowsFormsBrowser
         private Button _toggleVisualEditorButton;
         private System.Windows.Forms.Timer _editorPreviewTimer;
         private System.Windows.Forms.Timer _editorSyntaxTimer;
+        private System.Windows.Forms.Timer _editorFullSyntaxTimer;
         private bool _suppressEditorTextChanged;
         private bool _isApplyingSyntaxHighlight;
         private bool _isRenderingEditorPreview;
@@ -62,13 +63,15 @@ namespace WebView2WindowsFormsBrowser
         private bool _syncEditorFromNavigation;
         private string _pendingVisualEditorHtml = string.Empty;
         private Uri _editorBaseUri;
-        private const int SyntaxHighlightMaxChars = 35000;
+        private const int SyntaxHighlightMaxChars = 14000;
         private const int SyntaxHighlightViewportPadding = 3000;
+        private const int SyntaxTypingViewportThresholdChars = 8000;
         private const int ScriptFormatMaxChars = 80000;
         private const int CssFormatMaxChars = 80000;
         private static readonly Regex HtmlCommentPattern = new Regex("<!--[\\s\\S]*?-->", RegexOptions.Compiled);
         private static readonly Regex HtmlDoctypePattern = new Regex("<!DOCTYPE[\\s\\S]*?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex HtmlEntityPattern = new Regex("&(?:#\\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);", RegexOptions.Compiled);
+        private static readonly Regex HtmlBaseTagPattern = new Regex("<base\\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex HtmlScriptBlockPattern = new Regex("<script\\b[^>]*>(?<code>[\\s\\S]*?)</script\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex JavaScriptBlockCommentPattern = new Regex("/\\*[\\s\\S]*?\\*/", RegexOptions.Compiled);
         private static readonly Regex JavaScriptLineCommentPattern = new Regex("//.*?$", RegexOptions.Multiline | RegexOptions.Compiled);
@@ -78,6 +81,12 @@ namespace WebView2WindowsFormsBrowser
         private static readonly Regex JavaScriptKeywordPattern = new Regex("\\b(?:async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|of|return|super|switch|this|throw|try|typeof|var|void|while|with|yield)\\b", RegexOptions.Compiled);
         private static readonly Regex JavaScriptLiteralPattern = new Regex("\\b(?:true|false|null|undefined|NaN|Infinity)\\b", RegexOptions.Compiled);
         private static readonly Regex JavaScriptNumberPattern = new Regex("\\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(?:\\d[\\d_]*)(?:\\.(?:\\d[\\d_]*))?(?:[eE][+\\-]?\\d[\\d_]*)?|\\.\\d[\\d_]*(?:[eE][+\\-]?\\d[\\d_]*)?)\\b", RegexOptions.Compiled);
+        private static readonly Regex CssAtRulePattern = new Regex("@[a-zA-Z-]+\\b", RegexOptions.Compiled);
+        private static readonly Regex CssSelectorPattern = new Regex("(^|})\\s*(?<sel>[^@\\r\\n{}][^\\{\\r\\n]*)\\{", RegexOptions.Multiline | RegexOptions.Compiled);
+        private static readonly Regex CssPropertyPattern = new Regex("(^\\s*|[;{]\\s*)(?<prop>[-*a-zA-Z_][a-zA-Z0-9_-]*)\\s*:", RegexOptions.Multiline | RegexOptions.Compiled);
+        private static readonly Regex CssKeywordPattern = new Regex("\\b(?:important|inherit|initial|unset|revert|auto|none|block|inline|inline-block|flex|grid|absolute|relative|fixed|sticky)\\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex CssHexColorPattern = new Regex("#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\\b", RegexOptions.Compiled);
+        private static readonly Regex CssNumberPattern = new Regex("(?<![\\w-])(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:%|px|em|rem|vh|vw|vmin|vmax|ms|s|deg|rad|turn|fr|ch|ex|cm|mm|in|pt|pc)?\\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private UiTheme _currentTheme = UiTheme.Dark;
         private static readonly Color EditorBaseColor = Color.FromArgb(232, 236, 244);
         private static readonly Color EditorCommentColor = Color.FromArgb(120, 160, 120);
@@ -1785,7 +1794,14 @@ namespace WebView2WindowsFormsBrowser
             _editorPreviewTimer.Stop();
             _editorPreviewTimer.Start();
 
-            QueueEditorSyntaxHighlight(viewportOnly: false);
+            bool preferViewportOnly = _htmlEditor != null && _htmlEditor.TextLength > SyntaxTypingViewportThresholdChars;
+            QueueEditorSyntaxHighlight(viewportOnly: preferViewportOnly);
+
+            if (_editorFullSyntaxTimer != null)
+            {
+                _editorFullSyntaxTimer.Stop();
+                _editorFullSyntaxTimer.Start();
+            }
         }
 
         private void htmlEditor_VScroll(object sender, EventArgs e)
@@ -1828,6 +1844,16 @@ namespace WebView2WindowsFormsBrowser
             bool viewportOnly = _viewportOnlySyntaxHighlightPending;
             _viewportOnlySyntaxHighlightPending = false;
             ApplyHtmlSyntaxHighlight(viewportOnly);
+        }
+
+        private void editorFullSyntaxTimer_Tick(object sender, EventArgs e)
+        {
+            _editorFullSyntaxTimer.Stop();
+            if (_isApplyingSyntaxHighlight || _suppressEditorTextChanged)
+                return;
+
+            // Full pass only after idle time; typing path keeps viewport-only coloring responsive.
+            ApplyHtmlSyntaxHighlight(viewportOnlyMode: false);
         }
 
         private async Task SyncEditorWithCurrentPageAsync()
@@ -2587,6 +2613,10 @@ namespace WebView2WindowsFormsBrowser
                     ApplyHtmlTagColoring(colorText, colorStart);
                     ApplyRegexColor(HtmlEntityPattern, colorText, colorStart, GetEditorEntitySyntaxColor());
                     ApplyScriptBlockJavaScriptColoring(text, colorStart, colorLength, viewportOnlyMode);
+                    ApplyStyleBlockCssColoring(text, colorStart, colorLength, viewportOnlyMode);
+
+                    if (LooksLikeStandaloneCss(text))
+                        ApplyCssSyntaxColoring(colorText, colorStart);
                 }
 
                 RestoreEditorSelectionAndScroll(selectionStart, selectionLength, scrollPos);
@@ -2609,8 +2639,9 @@ namespace WebView2WindowsFormsBrowser
             int safeStart = Math.Clamp(selectionStart, 0, textLength);
             int safeLength = Math.Clamp(selectionLength, 0, Math.Max(0, textLength - safeStart));
 
-            SetRichTextScrollPosition(_htmlEditor, scrollPos);
+            // Select first, then restore scroll. Selecting can auto-scroll caret into view.
             _htmlEditor.Select(safeStart, safeLength);
+            SetRichTextScrollPosition(_htmlEditor, scrollPos);
         }
 
         private void ApplyRegexColor(Regex pattern, string text, int offset, Color color)
@@ -2619,6 +2650,19 @@ namespace WebView2WindowsFormsBrowser
             {
                 if (match.Success && match.Length > 0)
                     ColorizeRange(offset + match.Index, match.Length, color);
+            }
+        }
+
+        private void ApplyRegexGroupColor(Regex pattern, string text, int offset, string groupName, Color color)
+        {
+            foreach (Match match in pattern.Matches(text))
+            {
+                if (!match.Success)
+                    continue;
+
+                Group group = match.Groups[groupName];
+                if (group.Success && group.Length > 0)
+                    ColorizeRange(offset + group.Index, group.Length, color);
             }
         }
 
@@ -2784,44 +2828,115 @@ namespace WebView2WindowsFormsBrowser
             if (anyApplied)
                 return;
 
-            // Local fallback for very large script blocks where the closing tag is outside the viewport scan.
-            int localBacktrack = viewportOnlyMode ? 16384 : 65536;
-            int localForward = viewportOnlyMode ? 4096 : 32768;
-            int localStart = Math.Max(0, colorStart - localBacktrack);
-            int localEnd = Math.Min(fullText.Length, colorEnd + localForward);
-            if (localEnd <= localStart)
+            // Robust fallback for very large script blocks where closing tag is far outside viewport scan.
+            if (TryGetEnclosingScriptRange(fullText, colorStart, out int absScriptStart, out int absScriptEnd) ||
+                TryGetEnclosingScriptRange(fullText, Math.Max(colorStart, colorEnd - 1), out absScriptStart, out absScriptEnd))
+            {
+                int fallbackHighlightStart = Math.Max(absScriptStart, colorStart);
+                int fallbackHighlightEnd = Math.Min(absScriptEnd, colorEnd);
+                if (fallbackHighlightEnd > fallbackHighlightStart)
+                {
+                    string fallbackScriptText = fullText.Substring(fallbackHighlightStart, fallbackHighlightEnd - fallbackHighlightStart);
+                    ApplyJavaScriptSyntaxColoring(fallbackScriptText, fallbackHighlightStart);
+                }
+            }
+        }
+
+        private void ApplyStyleBlockCssColoring(string fullText, int colorStart, int colorLength, bool viewportOnlyMode)
+        {
+            if (string.IsNullOrEmpty(fullText) || colorLength <= 0)
                 return;
 
-            string localText = fullText.Substring(localStart, localEnd - localStart);
-            int relProbe = Math.Clamp(colorStart - localStart, 0, Math.Max(0, localText.Length - 1));
-
-            int relOpenBefore = localText.LastIndexOf("<script", relProbe, StringComparison.OrdinalIgnoreCase);
-            int relCloseBefore = localText.LastIndexOf("</script", relProbe, StringComparison.OrdinalIgnoreCase);
-
-            int relOpenCandidate = relOpenBefore > relCloseBefore
-                ? relOpenBefore
-                : localText.IndexOf("<script", relProbe, StringComparison.OrdinalIgnoreCase);
-
-            if (relOpenCandidate < 0)
+            int colorEnd = Math.Min(fullText.Length, colorStart + colorLength);
+            int styleScanPadding = viewportOnlyMode ? 1536 : 4096;
+            int scanStart = Math.Max(0, colorStart - styleScanPadding);
+            int scanEnd = Math.Min(fullText.Length, colorEnd + styleScanPadding);
+            if (scanEnd <= scanStart)
                 return;
 
-            int relOpenTagEnd = localText.IndexOf('>', relOpenCandidate);
-            if (relOpenTagEnd < 0)
+            bool anyApplied = false;
+            string scanText = fullText.Substring(scanStart, scanEnd - scanStart);
+            int cursor = 0;
+            while (cursor < scanText.Length)
+            {
+                int openStyle = scanText.IndexOf("<style", cursor, StringComparison.OrdinalIgnoreCase);
+                if (openStyle < 0)
+                    break;
+
+                int openTagEnd = scanText.IndexOf('>', openStyle);
+                if (openTagEnd < 0)
+                    break;
+
+                int codeStartLocal = openTagEnd + 1;
+                int closeStyle = scanText.IndexOf("</style", codeStartLocal, StringComparison.OrdinalIgnoreCase);
+                int codeEndLocal = closeStyle >= 0 ? closeStyle : scanText.Length;
+                if (codeEndLocal <= codeStartLocal)
+                {
+                    cursor = openTagEnd + 1;
+                    continue;
+                }
+
+                int styleStart = scanStart + codeStartLocal;
+                int styleEnd = scanStart + codeEndLocal;
+                int highlightStart = Math.Max(styleStart, colorStart);
+                int highlightEnd = Math.Min(styleEnd, colorEnd);
+                if (highlightEnd > highlightStart)
+                {
+                    string styleText = fullText.Substring(highlightStart, highlightEnd - highlightStart);
+                    ApplyCssSyntaxColoring(styleText, highlightStart);
+                    anyApplied = true;
+                }
+
+                cursor = closeStyle >= 0 ? closeStyle + 8 : scanText.Length;
+            }
+
+            if (anyApplied)
                 return;
 
-            int relScriptStart = relOpenTagEnd + 1;
-            int relScriptClose = localText.IndexOf("</script", relScriptStart, StringComparison.OrdinalIgnoreCase);
+            if (TryGetEnclosingStyleRange(fullText, colorStart, out int absStyleStart, out int absStyleEnd) ||
+                TryGetEnclosingStyleRange(fullText, Math.Max(colorStart, colorEnd - 1), out absStyleStart, out absStyleEnd))
+            {
+                int fallbackHighlightStart = Math.Max(absStyleStart, colorStart);
+                int fallbackHighlightEnd = Math.Min(absStyleEnd, colorEnd);
+                if (fallbackHighlightEnd > fallbackHighlightStart)
+                {
+                    string fallbackStyleText = fullText.Substring(fallbackHighlightStart, fallbackHighlightEnd - fallbackHighlightStart);
+                    ApplyCssSyntaxColoring(fallbackStyleText, fallbackHighlightStart);
+                }
+            }
+        }
 
-            int absScriptStart = localStart + relScriptStart;
-            int absScriptEnd = relScriptClose >= 0 ? localStart + relScriptClose : colorEnd;
-
-            int fallbackHighlightStart = Math.Max(absScriptStart, colorStart);
-            int fallbackHighlightEnd = Math.Min(absScriptEnd, colorEnd);
-            if (fallbackHighlightEnd <= fallbackHighlightStart)
+        private void ApplyCssSyntaxColoring(string text, int offset)
+        {
+            if (string.IsNullOrEmpty(text))
                 return;
 
-            string fallbackScriptText = fullText.Substring(fallbackHighlightStart, fallbackHighlightEnd - fallbackHighlightStart);
-            ApplyJavaScriptSyntaxColoring(fallbackScriptText, fallbackHighlightStart);
+            ApplyRegexColor(JavaScriptBlockCommentPattern, text, offset, GetEditorCommentSyntaxColor());
+            ApplyRegexColor(JavaScriptSingleQuotedStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
+            ApplyRegexColor(JavaScriptDoubleQuotedStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
+            ApplyRegexGroupColor(CssSelectorPattern, text, offset, "sel", GetEditorTagNameSyntaxColor());
+            ApplyRegexColor(CssAtRulePattern, text, offset, GetEditorJavaScriptKeywordSyntaxColor());
+            ApplyRegexGroupColor(CssPropertyPattern, text, offset, "prop", GetEditorAttributeNameSyntaxColor());
+            ApplyRegexColor(CssKeywordPattern, text, offset, GetEditorJavaScriptLiteralSyntaxColor());
+            ApplyRegexColor(CssHexColorPattern, text, offset, GetEditorEntitySyntaxColor());
+            ApplyRegexColor(CssNumberPattern, text, offset, GetEditorJavaScriptNumberSyntaxColor());
+        }
+
+        private static bool LooksLikeStandaloneCss(string fullText)
+        {
+            if (string.IsNullOrWhiteSpace(fullText))
+                return false;
+
+            int length = Math.Min(fullText.Length, 12000);
+            string probe = fullText.Substring(0, length);
+
+            bool hasMarkup = probe.IndexOf('<') >= 0 && probe.IndexOf('>') >= 0;
+            if (hasMarkup)
+                return false;
+
+            bool hasRuleMarkers = probe.IndexOf('{') >= 0 && probe.IndexOf('}') >= 0;
+            bool hasDeclarations = probe.IndexOf(':') >= 0 && (probe.IndexOf(';') >= 0 || probe.IndexOf('\n') >= 0);
+            return hasRuleMarkers && hasDeclarations;
         }
 
         private void ApplyJavaScriptSyntaxColoring(string text, int offset)
@@ -2829,14 +2944,53 @@ namespace WebView2WindowsFormsBrowser
             if (string.IsNullOrEmpty(text))
                 return;
 
-            ApplyRegexColor(JavaScriptKeywordPattern, text, offset, GetEditorJavaScriptKeywordSyntaxColor());
-            ApplyRegexColor(JavaScriptLiteralPattern, text, offset, GetEditorJavaScriptLiteralSyntaxColor());
-            ApplyRegexColor(JavaScriptNumberPattern, text, offset, GetEditorJavaScriptNumberSyntaxColor());
+            // Comments first, then strings so URL-like text in JSON/JS strings is not incorrectly painted as comments.
+            ApplyRegexColor(JavaScriptBlockCommentPattern, text, offset, GetEditorCommentSyntaxColor());
+            ApplyRegexColor(JavaScriptLineCommentPattern, text, offset, GetEditorCommentSyntaxColor());
             ApplyRegexColor(JavaScriptSingleQuotedStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
             ApplyRegexColor(JavaScriptDoubleQuotedStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
             ApplyRegexColor(JavaScriptTemplateStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
-            ApplyRegexColor(JavaScriptLineCommentPattern, text, offset, GetEditorCommentSyntaxColor());
-            ApplyRegexColor(JavaScriptBlockCommentPattern, text, offset, GetEditorCommentSyntaxColor());
+            ApplyRegexColor(JavaScriptKeywordPattern, text, offset, GetEditorJavaScriptKeywordSyntaxColor());
+            ApplyRegexColor(JavaScriptLiteralPattern, text, offset, GetEditorJavaScriptLiteralSyntaxColor());
+            ApplyRegexColor(JavaScriptNumberPattern, text, offset, GetEditorJavaScriptNumberSyntaxColor());
+        }
+
+        private static bool TryGetEnclosingScriptRange(string fullText, int probeIndex, out int scriptStart, out int scriptEnd)
+        {
+            return TryGetEnclosingTagCodeRange(fullText, probeIndex, "<script", "</script", out scriptStart, out scriptEnd);
+        }
+
+        private static bool TryGetEnclosingStyleRange(string fullText, int probeIndex, out int styleStart, out int styleEnd)
+        {
+            return TryGetEnclosingTagCodeRange(fullText, probeIndex, "<style", "</style", out styleStart, out styleEnd);
+        }
+
+        private static bool TryGetEnclosingTagCodeRange(string fullText, int probeIndex, string openTagPrefix, string closeTagPrefix, out int codeStart, out int codeEnd)
+        {
+            codeStart = 0;
+            codeEnd = 0;
+
+            if (string.IsNullOrEmpty(fullText))
+                return false;
+
+            int safeProbe = Math.Clamp(probeIndex, 0, Math.Max(0, fullText.Length - 1));
+            int openTagStart = fullText.LastIndexOf(openTagPrefix, safeProbe, StringComparison.OrdinalIgnoreCase);
+            if (openTagStart < 0)
+                return false;
+
+            int closeTagBeforeProbe = fullText.LastIndexOf(closeTagPrefix, safeProbe, StringComparison.OrdinalIgnoreCase);
+            if (closeTagBeforeProbe > openTagStart)
+                return false;
+
+            int openTagEnd = fullText.IndexOf('>', openTagStart);
+            if (openTagEnd < 0)
+                return false;
+
+            codeStart = openTagEnd + 1;
+            int closeTagAfter = fullText.IndexOf(closeTagPrefix, codeStart, StringComparison.OrdinalIgnoreCase);
+            codeEnd = closeTagAfter >= 0 ? closeTagAfter : fullText.Length;
+
+            return codeEnd > codeStart;
         }
 
         private static int FindTagEnd(string text, int startIndex)
@@ -3132,27 +3286,34 @@ namespace WebView2WindowsFormsBrowser
 
             try
             {
-                var doc = new HtmlAgilityPack.HtmlDocument();
-                doc.LoadHtml(html);
+                string baseTag = "<base href=\"" + WebUtility.HtmlEncode(_editorBaseUri.AbsoluteUri) + "\" />";
+                if (HtmlBaseTagPattern.IsMatch(html))
+                    return HtmlBaseTagPattern.Replace(html, baseTag, 1);
 
-                var htmlNode = doc.DocumentNode.SelectSingleNode("//html");
-                if (htmlNode == null)
-                    return html;
-
-                var head = htmlNode.SelectSingleNode("./head");
-                if (head == null)
+                int headOpenIndex = html.IndexOf("<head", StringComparison.OrdinalIgnoreCase);
+                if (headOpenIndex >= 0)
                 {
-                    head = doc.CreateElement("head");
-                    htmlNode.PrependChild(head);
+                    int headOpenEnd = html.IndexOf('>', headOpenIndex);
+                    if (headOpenEnd >= 0)
+                        return html.Insert(headOpenEnd + 1, "\n  " + baseTag);
                 }
 
-                var baseNode = head.SelectSingleNode("./base[@href]") ?? doc.CreateElement("base");
-                baseNode.SetAttributeValue("href", _editorBaseUri.AbsoluteUri);
+                int htmlOpenIndex = html.IndexOf("<html", StringComparison.OrdinalIgnoreCase);
+                if (htmlOpenIndex >= 0)
+                {
+                    int htmlOpenEnd = html.IndexOf('>', htmlOpenIndex);
+                    if (htmlOpenEnd >= 0)
+                    {
+                        string headBlock = "\n<head>\n  " + baseTag + "\n</head>";
+                        return html.Insert(htmlOpenEnd + 1, headBlock);
+                    }
+                }
 
-                if (baseNode.ParentNode == null)
-                    head.PrependChild(baseNode);
+                int doctypeEnd = html.IndexOf('>');
+                if (doctypeEnd >= 0 && html.IndexOf("<!DOCTYPE", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return html.Insert(doctypeEnd + 1, "\n<head>\n  " + baseTag + "\n</head>");
 
-                return doc.DocumentNode.OuterHtml;
+                return "<head>" + baseTag + "</head>\n" + html;
             }
             catch
             {
@@ -3426,7 +3587,7 @@ namespace WebView2WindowsFormsBrowser
 
             _editorPreviewTimer = new System.Windows.Forms.Timer
             {
-                Interval = 350
+                Interval = 650
             };
             _editorPreviewTimer.Tick += editorPreviewTimer_Tick;
 
@@ -3435,6 +3596,12 @@ namespace WebView2WindowsFormsBrowser
                 Interval = 420
             };
             _editorSyntaxTimer.Tick += editorSyntaxTimer_Tick;
+
+            _editorFullSyntaxTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 1250
+            };
+            _editorFullSyntaxTimer.Tick += editorFullSyntaxTimer_Tick;
 
             ApplyCommandButtonStyles();
 
