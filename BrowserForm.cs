@@ -58,16 +58,26 @@ namespace WebView2WindowsFormsBrowser
         private bool _ignoreNextVisualEditorMessage;
         private bool _isSyncingSourceFromVisualEditor;
         private bool _isVisualEditorPanelOpen;
+        private bool _viewportOnlySyntaxHighlightPending;
         private bool _syncEditorFromNavigation;
         private string _pendingVisualEditorHtml = string.Empty;
         private Uri _editorBaseUri;
-        private const int SyntaxHighlightMaxChars = 120000;
-        private const int SyntaxHighlightViewportPadding = 20000;
+        private const int SyntaxHighlightMaxChars = 35000;
+        private const int SyntaxHighlightViewportPadding = 3000;
         private const int ScriptFormatMaxChars = 80000;
         private const int CssFormatMaxChars = 80000;
         private static readonly Regex HtmlCommentPattern = new Regex("<!--[\\s\\S]*?-->", RegexOptions.Compiled);
         private static readonly Regex HtmlDoctypePattern = new Regex("<!DOCTYPE[\\s\\S]*?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex HtmlEntityPattern = new Regex("&(?:#\\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);", RegexOptions.Compiled);
+        private static readonly Regex HtmlScriptBlockPattern = new Regex("<script\\b[^>]*>(?<code>[\\s\\S]*?)</script\\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex JavaScriptBlockCommentPattern = new Regex("/\\*[\\s\\S]*?\\*/", RegexOptions.Compiled);
+        private static readonly Regex JavaScriptLineCommentPattern = new Regex("//.*?$", RegexOptions.Multiline | RegexOptions.Compiled);
+        private static readonly Regex JavaScriptSingleQuotedStringPattern = new Regex("'(?:\\\\.|[^'\\\\])*'", RegexOptions.Compiled);
+        private static readonly Regex JavaScriptDoubleQuotedStringPattern = new Regex("\"(?:\\\\.|[^\"\\\\])*\"", RegexOptions.Compiled);
+        private static readonly Regex JavaScriptTemplateStringPattern = new Regex("`(?:\\\\.|[^`\\\\])*`", RegexOptions.Compiled);
+        private static readonly Regex JavaScriptKeywordPattern = new Regex("\\b(?:async|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|of|return|super|switch|this|throw|try|typeof|var|void|while|with|yield)\\b", RegexOptions.Compiled);
+        private static readonly Regex JavaScriptLiteralPattern = new Regex("\\b(?:true|false|null|undefined|NaN|Infinity)\\b", RegexOptions.Compiled);
+        private static readonly Regex JavaScriptNumberPattern = new Regex("\\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(?:\\d[\\d_]*)(?:\\.(?:\\d[\\d_]*))?(?:[eE][+\\-]?\\d[\\d_]*)?|\\.\\d[\\d_]*(?:[eE][+\\-]?\\d[\\d_]*)?)\\b", RegexOptions.Compiled);
         private UiTheme _currentTheme = UiTheme.Dark;
         private static readonly Color EditorBaseColor = Color.FromArgb(232, 236, 244);
         private static readonly Color EditorCommentColor = Color.FromArgb(120, 160, 120);
@@ -76,6 +86,10 @@ namespace WebView2WindowsFormsBrowser
         private static readonly Color EditorAttributeNameColor = Color.FromArgb(244, 114, 182);
         private static readonly Color EditorAttributeValueColor = Color.FromArgb(253, 186, 116);
         private static readonly Color EditorEntityColor = Color.FromArgb(45, 212, 191);
+        private static readonly Color EditorJavaScriptKeywordColor = Color.FromArgb(196, 181, 253);
+        private static readonly Color EditorJavaScriptStringColor = Color.FromArgb(134, 239, 172);
+        private static readonly Color EditorJavaScriptNumberColor = Color.FromArgb(251, 146, 60);
+        private static readonly Color EditorJavaScriptLiteralColor = Color.FromArgb(56, 189, 248);
         private static readonly Color EditorBaseColorLight = Color.FromArgb(31, 41, 55);
         private static readonly Color EditorCommentColorLight = Color.FromArgb(22, 101, 52);
         private static readonly Color EditorTagBracketColorLight = Color.FromArgb(71, 85, 105);
@@ -83,6 +97,10 @@ namespace WebView2WindowsFormsBrowser
         private static readonly Color EditorAttributeNameColorLight = Color.FromArgb(190, 24, 93);
         private static readonly Color EditorAttributeValueColorLight = Color.FromArgb(180, 83, 9);
         private static readonly Color EditorEntityColorLight = Color.FromArgb(13, 148, 136);
+        private static readonly Color EditorJavaScriptKeywordColorLight = Color.FromArgb(91, 33, 182);
+        private static readonly Color EditorJavaScriptStringColorLight = Color.FromArgb(22, 101, 52);
+        private static readonly Color EditorJavaScriptNumberColorLight = Color.FromArgb(194, 65, 12);
+        private static readonly Color EditorJavaScriptLiteralColorLight = Color.FromArgb(3, 105, 161);
         private const int WM_SETREDRAW = 0x000B;
         private const int EM_GETSCROLLPOS = 0x0400 + 221;
         private const int EM_SETSCROLLPOS = 0x0400 + 222;
@@ -1767,11 +1785,35 @@ namespace WebView2WindowsFormsBrowser
             _editorPreviewTimer.Stop();
             _editorPreviewTimer.Start();
 
-            if (_editorSyntaxTimer != null)
-            {
-                _editorSyntaxTimer.Stop();
-                _editorSyntaxTimer.Start();
-            }
+            QueueEditorSyntaxHighlight(viewportOnly: false);
+        }
+
+        private void htmlEditor_VScroll(object sender, EventArgs e)
+        {
+            QueueViewportSyntaxHighlight();
+        }
+
+        private void htmlEditor_HScroll(object sender, EventArgs e)
+        {
+            QueueViewportSyntaxHighlight();
+        }
+
+        private void QueueEditorSyntaxHighlight(bool viewportOnly = false)
+        {
+            if (_editorSyntaxTimer == null || _suppressEditorTextChanged || _isApplyingSyntaxHighlight)
+                return;
+
+            _viewportOnlySyntaxHighlightPending = viewportOnly;
+            _editorSyntaxTimer.Stop();
+            _editorSyntaxTimer.Start();
+        }
+
+        private void QueueViewportSyntaxHighlight()
+        {
+            if (_htmlEditor == null || _htmlEditor.TextLength <= SyntaxHighlightMaxChars)
+                return;
+
+            QueueEditorSyntaxHighlight(viewportOnly: true);
         }
 
         private async void editorPreviewTimer_Tick(object sender, EventArgs e)
@@ -1783,7 +1825,9 @@ namespace WebView2WindowsFormsBrowser
         private void editorSyntaxTimer_Tick(object sender, EventArgs e)
         {
             _editorSyntaxTimer.Stop();
-            ApplyHtmlSyntaxHighlight();
+            bool viewportOnly = _viewportOnlySyntaxHighlightPending;
+            _viewportOnlySyntaxHighlightPending = false;
+            ApplyHtmlSyntaxHighlight(viewportOnly);
         }
 
         private async Task SyncEditorWithCurrentPageAsync()
@@ -2480,7 +2524,7 @@ namespace WebView2WindowsFormsBrowser
             return sb.ToString();
         }
 
-        private void ApplyHtmlSyntaxHighlight()
+        private void ApplyHtmlSyntaxHighlight(bool viewportOnlyMode = false)
         {
             if (_htmlEditor == null || _isApplyingSyntaxHighlight)
                 return;
@@ -2503,13 +2547,28 @@ namespace WebView2WindowsFormsBrowser
                 int colorLength = text.Length;
                 if (text.Length > SyntaxHighlightMaxChars)
                 {
-                    int viewportStart = _htmlEditor.GetCharIndexFromPosition(new Point(1, 1));
-                    int viewportEnd = _htmlEditor.GetCharIndexFromPosition(new Point(
+                    int viewportStart = Math.Max(0, _htmlEditor.GetCharIndexFromPosition(new Point(1, 1)));
+                    int viewportEnd = Math.Max(0, _htmlEditor.GetCharIndexFromPosition(new Point(
                         Math.Max(1, _htmlEditor.ClientSize.Width - 4),
-                        Math.Max(1, _htmlEditor.ClientSize.Height - 4)));
+                        Math.Max(1, _htmlEditor.ClientSize.Height - 4))));
+                    if (viewportEnd < viewportStart)
+                        viewportEnd = viewportStart;
 
-                    int focusStart = Math.Min(viewportStart, selectionStart);
-                    int focusEnd = Math.Max(viewportEnd, selectionStart + selectionLength);
+                    int focusStart = viewportStart;
+                    int focusEnd = viewportEnd;
+                    if (!viewportOnlyMode)
+                    {
+                        int selectionEnd = selectionStart + selectionLength;
+                        bool selectionNearViewport =
+                            selectionEnd >= viewportStart - SyntaxHighlightViewportPadding &&
+                            selectionStart <= viewportEnd + SyntaxHighlightViewportPadding;
+
+                        if (selectionNearViewport)
+                        {
+                            focusStart = Math.Min(viewportStart, selectionStart);
+                            focusEnd = Math.Max(viewportEnd, selectionEnd);
+                        }
+                    }
 
                     colorStart = Math.Max(0, focusStart - SyntaxHighlightViewportPadding);
                     int colorEnd = Math.Min(text.Length, Math.Max(focusEnd, colorStart) + SyntaxHighlightViewportPadding);
@@ -2527,6 +2586,7 @@ namespace WebView2WindowsFormsBrowser
                     ApplyRegexColor(HtmlDoctypePattern, colorText, colorStart, GetEditorCommentSyntaxColor());
                     ApplyHtmlTagColoring(colorText, colorStart);
                     ApplyRegexColor(HtmlEntityPattern, colorText, colorStart, GetEditorEntitySyntaxColor());
+                    ApplyScriptBlockJavaScriptColoring(text, colorStart, colorLength, viewportOnlyMode);
                 }
 
                 RestoreEditorSelectionAndScroll(selectionStart, selectionLength, scrollPos);
@@ -2684,6 +2744,99 @@ namespace WebView2WindowsFormsBrowser
 
                 i = tagEnd + 1;
             }
+        }
+
+        private void ApplyScriptBlockJavaScriptColoring(string fullText, int colorStart, int colorLength, bool viewportOnlyMode)
+        {
+            if (string.IsNullOrEmpty(fullText) || colorLength <= 0)
+                return;
+
+            int colorEnd = Math.Min(fullText.Length, colorStart + colorLength);
+            int scriptScanPadding = viewportOnlyMode ? 1536 : 4096;
+            int scanStart = Math.Max(0, colorStart - scriptScanPadding);
+            int scanEnd = Math.Min(fullText.Length, colorEnd + scriptScanPadding);
+            if (scanEnd <= scanStart)
+                return;
+
+            bool anyApplied = false;
+            string scanText = fullText.Substring(scanStart, scanEnd - scanStart);
+            foreach (Match match in HtmlScriptBlockPattern.Matches(scanText))
+            {
+                if (!match.Success)
+                    continue;
+
+                Group codeGroup = match.Groups["code"];
+                if (!codeGroup.Success || codeGroup.Length <= 0)
+                    continue;
+
+                int scriptStart = scanStart + codeGroup.Index;
+                int scriptEnd = scriptStart + codeGroup.Length;
+                int highlightStart = Math.Max(scriptStart, colorStart);
+                int highlightEnd = Math.Min(scriptEnd, colorEnd);
+                if (highlightEnd <= highlightStart)
+                    continue;
+
+                string scriptText = fullText.Substring(highlightStart, highlightEnd - highlightStart);
+                ApplyJavaScriptSyntaxColoring(scriptText, highlightStart);
+                anyApplied = true;
+            }
+
+            if (anyApplied)
+                return;
+
+            // Local fallback for very large script blocks where the closing tag is outside the viewport scan.
+            int localBacktrack = viewportOnlyMode ? 16384 : 65536;
+            int localForward = viewportOnlyMode ? 4096 : 32768;
+            int localStart = Math.Max(0, colorStart - localBacktrack);
+            int localEnd = Math.Min(fullText.Length, colorEnd + localForward);
+            if (localEnd <= localStart)
+                return;
+
+            string localText = fullText.Substring(localStart, localEnd - localStart);
+            int relProbe = Math.Clamp(colorStart - localStart, 0, Math.Max(0, localText.Length - 1));
+
+            int relOpenBefore = localText.LastIndexOf("<script", relProbe, StringComparison.OrdinalIgnoreCase);
+            int relCloseBefore = localText.LastIndexOf("</script", relProbe, StringComparison.OrdinalIgnoreCase);
+
+            int relOpenCandidate = relOpenBefore > relCloseBefore
+                ? relOpenBefore
+                : localText.IndexOf("<script", relProbe, StringComparison.OrdinalIgnoreCase);
+
+            if (relOpenCandidate < 0)
+                return;
+
+            int relOpenTagEnd = localText.IndexOf('>', relOpenCandidate);
+            if (relOpenTagEnd < 0)
+                return;
+
+            int relScriptStart = relOpenTagEnd + 1;
+            int relScriptClose = localText.IndexOf("</script", relScriptStart, StringComparison.OrdinalIgnoreCase);
+
+            int absScriptStart = localStart + relScriptStart;
+            int absScriptEnd = relScriptClose >= 0 ? localStart + relScriptClose : colorEnd;
+
+            int fallbackHighlightStart = Math.Max(absScriptStart, colorStart);
+            int fallbackHighlightEnd = Math.Min(absScriptEnd, colorEnd);
+            if (fallbackHighlightEnd <= fallbackHighlightStart)
+                return;
+
+            string fallbackScriptText = fullText.Substring(fallbackHighlightStart, fallbackHighlightEnd - fallbackHighlightStart);
+            ApplyJavaScriptSyntaxColoring(fallbackScriptText, fallbackHighlightStart);
+        }
+
+        private void ApplyJavaScriptSyntaxColoring(string text, int offset)
+        {
+            if (string.IsNullOrEmpty(text))
+                return;
+
+            ApplyRegexColor(JavaScriptKeywordPattern, text, offset, GetEditorJavaScriptKeywordSyntaxColor());
+            ApplyRegexColor(JavaScriptLiteralPattern, text, offset, GetEditorJavaScriptLiteralSyntaxColor());
+            ApplyRegexColor(JavaScriptNumberPattern, text, offset, GetEditorJavaScriptNumberSyntaxColor());
+            ApplyRegexColor(JavaScriptSingleQuotedStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
+            ApplyRegexColor(JavaScriptDoubleQuotedStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
+            ApplyRegexColor(JavaScriptTemplateStringPattern, text, offset, GetEditorJavaScriptStringSyntaxColor());
+            ApplyRegexColor(JavaScriptLineCommentPattern, text, offset, GetEditorCommentSyntaxColor());
+            ApplyRegexColor(JavaScriptBlockCommentPattern, text, offset, GetEditorCommentSyntaxColor());
         }
 
         private static int FindTagEnd(string text, int startIndex)
@@ -2961,8 +3114,7 @@ namespace WebView2WindowsFormsBrowser
                 SetEditorText(html, formatHtml: false, resetCaret: false, applySyntaxHighlight: false);
                 if (_editorSyntaxTimer != null)
                 {
-                    _editorSyntaxTimer.Stop();
-                    _editorSyntaxTimer.Start();
+                    QueueEditorSyntaxHighlight(viewportOnly: false);
                 }
 
                 await RenderEditorToPreviewAsync(syncVisualEditor: false);
@@ -3198,6 +3350,7 @@ namespace WebView2WindowsFormsBrowser
                 Dock = DockStyle.Fill,
                 AcceptsTab = true,
                 WordWrap = false,
+                DetectUrls = false,
                 BorderStyle = BorderStyle.FixedSingle,
                 Font = new Font("Consolas", 11F, FontStyle.Regular),
                 BackColor = Color.FromArgb(14, 17, 24),
@@ -3205,6 +3358,8 @@ namespace WebView2WindowsFormsBrowser
                 ScrollBars = RichTextBoxScrollBars.Both
             };
             _htmlEditor.TextChanged += htmlEditor_TextChanged;
+            _htmlEditor.VScroll += htmlEditor_VScroll;
+            _htmlEditor.HScroll += htmlEditor_HScroll;
 
             _previewHostPanel = new Panel
             {
@@ -3525,6 +3680,26 @@ namespace WebView2WindowsFormsBrowser
         private Color GetEditorEntitySyntaxColor()
         {
             return _currentTheme == UiTheme.Dark ? EditorEntityColor : EditorEntityColorLight;
+        }
+
+        private Color GetEditorJavaScriptKeywordSyntaxColor()
+        {
+            return _currentTheme == UiTheme.Dark ? EditorJavaScriptKeywordColor : EditorJavaScriptKeywordColorLight;
+        }
+
+        private Color GetEditorJavaScriptStringSyntaxColor()
+        {
+            return _currentTheme == UiTheme.Dark ? EditorJavaScriptStringColor : EditorJavaScriptStringColorLight;
+        }
+
+        private Color GetEditorJavaScriptNumberSyntaxColor()
+        {
+            return _currentTheme == UiTheme.Dark ? EditorJavaScriptNumberColor : EditorJavaScriptNumberColorLight;
+        }
+
+        private Color GetEditorJavaScriptLiteralSyntaxColor()
+        {
+            return _currentTheme == UiTheme.Dark ? EditorJavaScriptLiteralColor : EditorJavaScriptLiteralColorLight;
         }
 
         private static Color GetReadableTextColor(Color backgroundColor)

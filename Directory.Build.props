@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts\**\*;obj\**\*;bin\**\*</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="artifacts\**\*.cs;obj\**\*.cs;bin\**\*.cs" />
+    <EmbeddedResource Remove="artifacts\**\*;obj\**\*;bin\**\*" />
+    <None Remove="artifacts\**\*;obj\**\*;bin\**\*" />
+  </ItemGroup>
+</Project>
