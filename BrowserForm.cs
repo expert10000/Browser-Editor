@@ -38,19 +38,28 @@ namespace WebView2WindowsFormsBrowser
         private CenteredFlowLayoutPanel _actionPanel;
         private Panel _addressShell;
         private SplitContainer _editorSplit;
+        private SplitContainer _designPreviewSplit;
         private Panel _previewHostPanel;
+        private Panel _visualEditorHostPanel;
         private RichTextBox _htmlEditor;
+        private WebView2 _visualEditorWebView;
         private Button _lightThemeButton;
         private Button _darkThemeButton;
         private Button _openHtmlButton;
         private Button _saveHtmlButton;
         private Button _formatHtmlButton;
+        private Button _toggleVisualEditorButton;
         private System.Windows.Forms.Timer _editorPreviewTimer;
         private System.Windows.Forms.Timer _editorSyntaxTimer;
         private bool _suppressEditorTextChanged;
         private bool _isApplyingSyntaxHighlight;
         private bool _isRenderingEditorPreview;
+        private bool _isRenderingVisualEditor;
+        private bool _ignoreNextVisualEditorMessage;
+        private bool _isSyncingSourceFromVisualEditor;
+        private bool _isVisualEditorPanelOpen;
         private bool _syncEditorFromNavigation;
+        private string _pendingVisualEditorHtml = string.Empty;
         private Uri _editorBaseUri;
         private const int SyntaxHighlightMaxChars = 120000;
         private const int SyntaxHighlightViewportPadding = 20000;
@@ -1596,6 +1605,35 @@ namespace WebView2WindowsFormsBrowser
             _ = RenderEditorToPreviewAsync();
         }
 
+        private void toggleVisualEditorButton_Click(object sender, EventArgs e)
+        {
+            SetVisualEditorPanelVisible(!_isVisualEditorPanelOpen);
+        }
+
+        private void SetVisualEditorPanelVisible(bool isVisible)
+        {
+            _isVisualEditorPanelOpen = isVisible;
+            if (_designPreviewSplit != null && !_designPreviewSplit.IsDisposed)
+                _designPreviewSplit.Panel1Collapsed = !isVisible;
+
+            if (isVisible)
+            {
+                string html = _htmlEditor?.Text ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(html))
+                    html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
+                _ = RenderHtmlToVisualEditorAsync(EnsureBaseTag(html));
+            }
+            else
+            {
+                _isRenderingVisualEditor = false;
+                _ignoreNextVisualEditorMessage = false;
+                _isSyncingSourceFromVisualEditor = false;
+            }
+
+            ApplyCommandButtonStyles();
+            UpdateEditorSplitLayout();
+        }
+
         private void darkThemeButton_Click(object sender, EventArgs e)
         {
             SetUiTheme(UiTheme.Dark);
@@ -1758,6 +1796,8 @@ namespace WebView2WindowsFormsBrowser
                 string html = await GetPageHtmlWithDocTypeAsync();
                 _editorBaseUri = webView2Control.Source;
                 SetEditorText(html, formatHtml: true);
+                if (_isVisualEditorPanelOpen)
+                    await RenderHtmlToVisualEditorAsync(EnsureBaseTag(html));
             }
             catch (Exception ex)
             {
@@ -1793,7 +1833,7 @@ namespace WebView2WindowsFormsBrowser
             return JsonSerializer.Deserialize<string>(raw) ?? string.Empty;
         }
 
-        private void SetEditorText(string html, bool formatHtml = false, bool resetCaret = true)
+        private void SetEditorText(string html, bool formatHtml = false, bool resetCaret = true, bool applySyntaxHighlight = true)
         {
             if (_htmlEditor == null)
                 return;
@@ -1807,7 +1847,9 @@ namespace WebView2WindowsFormsBrowser
                 _htmlEditor.SelectionLength = 0;
             }
             _suppressEditorTextChanged = false;
-            ApplyHtmlSyntaxHighlight();
+
+            if (applySyntaxHighlight)
+                ApplyHtmlSyntaxHighlight();
         }
 
         private static string FormatHtmlForEditor(string html)
@@ -2761,7 +2803,7 @@ namespace WebView2WindowsFormsBrowser
             }
         }
 
-        private async Task RenderEditorToPreviewAsync()
+        private async Task RenderEditorToPreviewAsync(bool syncVisualEditor = true)
         {
             if (_htmlEditor == null || webView2Control.CoreWebView2 == null)
                 return;
@@ -2776,7 +2818,159 @@ namespace WebView2WindowsFormsBrowser
             _syncEditorFromNavigation = false;
             _isRenderingEditorPreview = true;
             webView2Control.CoreWebView2.NavigateToString(htmlForPreview);
+
+            if (syncVisualEditor && _isVisualEditorPanelOpen && !_isSyncingSourceFromVisualEditor)
+                await RenderHtmlToVisualEditorAsync(htmlForPreview);
+        }
+
+        private async Task RenderHtmlToVisualEditorAsync(string htmlForPreview)
+        {
+            _pendingVisualEditorHtml = htmlForPreview ?? string.Empty;
+            if (!_isVisualEditorPanelOpen || _visualEditorWebView?.CoreWebView2 == null)
+                return;
+
+            _isRenderingVisualEditor = true;
+            _ignoreNextVisualEditorMessage = true;
+            _visualEditorWebView.CoreWebView2.NavigateToString(_pendingVisualEditorHtml);
             await Task.CompletedTask;
+        }
+
+        private static string GetVisualEditorBridgeScript()
+        {
+            return @"(() => {
+    const buildHtml = () => {
+        const dt = document.doctype;
+        let docType = '';
+        if (dt) {
+            docType = '<!DOCTYPE ' + dt.name;
+            if (dt.publicId) {
+                docType += ' PUBLIC ' + dt.publicId;
+            } else if (dt.systemId) {
+                docType += ' SYSTEM';
+            }
+            if (dt.systemId) {
+                docType += ' ' + dt.systemId;
+            }
+            docType += '>';
+        }
+        return docType + '\n' + document.documentElement.outerHTML;
+    };
+
+    const notifyHost = () => {
+        clearTimeout(window.__browserAiVisualTimer);
+        window.__browserAiVisualTimer = setTimeout(() => {
+            window.chrome.webview.postMessage(buildHtml());
+        }, 280);
+    };
+
+    document.designMode = 'on';
+    if (document.body) {
+        document.body.setAttribute('contenteditable', 'true');
+        document.body.spellcheck = false;
+    }
+
+    if (!window.__browserAiVisualHooked) {
+        ['input', 'keyup', 'paste', 'cut', 'drop', 'blur'].forEach((eventName) => {
+            document.addEventListener(eventName, notifyHost, true);
+        });
+        window.__browserAiVisualHooked = true;
+    }
+
+    notifyHost();
+})();";
+        }
+
+        private async void VisualEditorWebView_CoreWebView2InitializationCompleted(object sender, CoreWebView2InitializationCompletedEventArgs e)
+        {
+            if (!e.IsSuccess || _visualEditorWebView?.CoreWebView2 == null)
+                return;
+
+            _visualEditorWebView.CoreWebView2.WebMessageReceived += VisualEditorWebView_WebMessageReceived;
+
+            if (_isVisualEditorPanelOpen)
+            {
+                string initialHtml = string.IsNullOrWhiteSpace(_pendingVisualEditorHtml)
+                    ? "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><p>Visual editor ready.</p></body></html>"
+                    : _pendingVisualEditorHtml;
+
+                await RenderHtmlToVisualEditorAsync(initialHtml);
+            }
+        }
+
+        private async void VisualEditorWebView_NavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            if (_visualEditorWebView?.CoreWebView2 == null)
+                return;
+
+            if (!_isVisualEditorPanelOpen)
+            {
+                _isRenderingVisualEditor = false;
+                _ignoreNextVisualEditorMessage = false;
+                return;
+            }
+
+            if (!e.IsSuccess)
+            {
+                _isRenderingVisualEditor = false;
+                _ignoreNextVisualEditorMessage = false;
+                return;
+            }
+
+            try
+            {
+                await _visualEditorWebView.CoreWebView2.ExecuteScriptAsync(GetVisualEditorBridgeScript());
+            }
+            catch
+            {
+                _ignoreNextVisualEditorMessage = false;
+                // Ignore visual editor script failures and keep HTML source editing available.
+            }
+            finally
+            {
+                _isRenderingVisualEditor = false;
+            }
+        }
+
+        private async void VisualEditorWebView_WebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            if (!_isVisualEditorPanelOpen || _isRenderingVisualEditor || _isSyncingSourceFromVisualEditor || _htmlEditor == null)
+                return;
+
+            if (_ignoreNextVisualEditorMessage)
+            {
+                _ignoreNextVisualEditorMessage = false;
+                return;
+            }
+
+            string html;
+            try
+            {
+                html = JsonSerializer.Deserialize<string>(e.WebMessageAsJson) ?? string.Empty;
+            }
+            catch
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(html))
+                return;
+
+            _isSyncingSourceFromVisualEditor = true;
+            try
+            {
+                SetEditorText(html, formatHtml: false, resetCaret: false, applySyntaxHighlight: false);
+                if (_editorSyntaxTimer != null)
+                {
+                    _editorSyntaxTimer.Stop();
+                    _editorSyntaxTimer.Start();
+                }
+
+                await RenderEditorToPreviewAsync(syncVisualEditor: false);
+            }
+            finally
+            {
+                _isSyncingSourceFromVisualEditor = false;
+            }
         }
 
         private string EnsureBaseTag(string html)
@@ -2985,8 +3179,19 @@ namespace WebView2WindowsFormsBrowser
                 BackColor = Color.FromArgb(20, 24, 33)
             };
             _editorSplit.Panel1.Padding = new Padding(0, 2, 6, 0);
-            _editorSplit.Panel2.Padding = new Padding(6, 2, 0, 0);
+            _editorSplit.Panel2.Padding = new Padding(0, 2, 0, 0);
             _editorSplit.Resize += (_, __) => UpdateEditorSplitLayout();
+
+            _designPreviewSplit = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                SplitterWidth = 6,
+                BackColor = Color.FromArgb(20, 24, 33)
+            };
+            _designPreviewSplit.Panel1.Padding = new Padding(6, 0, 3, 0);
+            _designPreviewSplit.Panel2.Padding = new Padding(3, 0, 0, 0);
+            _designPreviewSplit.Resize += (_, __) => UpdateEditorSplitLayout();
 
             _htmlEditor = new RichTextBox
             {
@@ -3008,6 +3213,25 @@ namespace WebView2WindowsFormsBrowser
                 Padding = new Padding(0),
                 BackColor = Color.FromArgb(12, 14, 18)
             };
+
+            _visualEditorHostPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(12, 14, 18)
+            };
+
+            _visualEditorWebView = new WebView2
+            {
+                Dock = DockStyle.Fill,
+                Margin = new Padding(0),
+                AllowExternalDrop = false,
+                CreationProperties = this.CreationProperties,
+                DefaultBackgroundColor = Color.FromArgb(12, 14, 18)
+            };
+            _visualEditorWebView.CoreWebView2InitializationCompleted += VisualEditorWebView_CoreWebView2InitializationCompleted;
+            _visualEditorWebView.NavigationCompleted += VisualEditorWebView_NavigationCompleted;
 
             _openHtmlButton = new Button
             {
@@ -3039,6 +3263,12 @@ namespace WebView2WindowsFormsBrowser
             };
             _formatHtmlButton.Click += formatHtmlButton_Click;
 
+            _toggleVisualEditorButton = new Button
+            {
+                Text = "WYSIWYG"
+            };
+            _toggleVisualEditorButton.Click += toggleVisualEditorButton_Click;
+
             _editorPreviewTimer = new System.Windows.Forms.Timer
             {
                 Interval = 350
@@ -3063,6 +3293,7 @@ namespace WebView2WindowsFormsBrowser
             _openHtmlButton.Margin = new Padding(0, 0, 8, 0);
             _saveHtmlButton.Margin = new Padding(0, 0, 8, 0);
             _formatHtmlButton.Margin = new Padding(0, 0, 8, 0);
+            _toggleVisualEditorButton.Margin = new Padding(0, 0, 8, 0);
             linksBtn.Margin = new Padding(0, 0, 8, 0);
             ScrapeBtn.Margin = new Padding(0, 0, 8, 0);
 
@@ -3075,6 +3306,7 @@ namespace WebView2WindowsFormsBrowser
             SetButtonWidth(_openHtmlButton, 126);
             SetButtonWidth(_saveHtmlButton, 126);
             SetButtonWidth(_formatHtmlButton, 108);
+            SetButtonWidth(_toggleVisualEditorButton, 132);
             SetButtonWidth(linksBtn, 100);
             SetButtonWidth(ScrapeBtn, 112);
 
@@ -3110,6 +3342,7 @@ namespace WebView2WindowsFormsBrowser
             _actionPanel.Controls.Add(_openHtmlButton);
             _actionPanel.Controls.Add(_saveHtmlButton);
             _actionPanel.Controls.Add(_formatHtmlButton);
+            _actionPanel.Controls.Add(_toggleVisualEditorButton);
             _actionPanel.Controls.Add(linksBtn);
             _actionPanel.Controls.Add(ScrapeBtn);
             _actionPanel.Controls.Add(btnEvents);
@@ -3126,8 +3359,14 @@ namespace WebView2WindowsFormsBrowser
             PrepareWebViewControl(webView2Control);
 
             _editorSplit.Panel1.Controls.Add(_htmlEditor);
-            _editorSplit.Panel2.Controls.Add(_previewHostPanel);
+            _editorSplit.Panel2.Controls.Add(_designPreviewSplit);
+            _designPreviewSplit.Panel1.Controls.Add(_visualEditorHostPanel);
+            _designPreviewSplit.Panel2.Controls.Add(_previewHostPanel);
+            _visualEditorHostPanel.Controls.Add(_visualEditorWebView);
             _previewHostPanel.Controls.Add(webView2Control);
+            _visualEditorWebView.Source = new Uri("about:blank");
+            _designPreviewSplit.Panel1Collapsed = true;
+            _isVisualEditorPanelOpen = false;
             _contentPanel.Controls.Add(_editorSplit);
 
             Controls.Add(_contentPanel);
@@ -3141,7 +3380,7 @@ namespace WebView2WindowsFormsBrowser
             LayoutAddressBar();
             LayoutChromeContentBounds();
             UpdateEditorSplitLayout();
-            SetEditorText("<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\" />\n  <title>New Document</title>\n</head>\n<body>\n  <h1>Edit HTML on the left</h1>\n  <p>Preview updates live on the right.</p>\n</body>\n</html>", formatHtml: true);
+            SetEditorText("<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\" />\n  <title>New Document</title>\n</head>\n<body>\n  <h1>Edit HTML on the left</h1>\n  <p>Click WYSIWYG to open the middle visual editor. Preview stays on the right.</p>\n</body>\n</html>", formatHtml: true);
             ApplyThemeStyling();
         }
 
@@ -3191,6 +3430,12 @@ namespace WebView2WindowsFormsBrowser
             if (_editorSplit != null)
                 _editorSplit.BackColor = isDark ? Color.FromArgb(20, 24, 33) : Color.FromArgb(214, 225, 242);
 
+            if (_designPreviewSplit != null)
+                _designPreviewSplit.BackColor = isDark ? Color.FromArgb(18, 22, 32) : Color.FromArgb(214, 225, 242);
+
+            if (_visualEditorHostPanel != null)
+                _visualEditorHostPanel.BackColor = isDark ? Color.FromArgb(12, 14, 18) : Color.FromArgb(247, 250, 255);
+
             if (_previewHostPanel != null)
                 _previewHostPanel.BackColor = isDark ? Color.FromArgb(12, 14, 18) : Color.FromArgb(247, 250, 255);
 
@@ -3206,6 +3451,9 @@ namespace WebView2WindowsFormsBrowser
             if (webView2Control != null)
                 webView2Control.DefaultBackgroundColor = isDark ? Color.FromArgb(12, 14, 18) : Color.FromArgb(247, 250, 255);
 
+            if (_visualEditorWebView != null)
+                _visualEditorWebView.DefaultBackgroundColor = isDark ? Color.FromArgb(12, 14, 18) : Color.FromArgb(247, 250, 255);
+
             ApplyCommandButtonStyles();
             ApplyHtmlSyntaxHighlight();
         }
@@ -3220,6 +3468,8 @@ namespace WebView2WindowsFormsBrowser
             ApplyButtonStyle(_openHtmlButton, Color.FromArgb(251, 146, 60));
             ApplyButtonStyle(_saveHtmlButton, Color.FromArgb(34, 197, 94));
             ApplyButtonStyle(_formatHtmlButton, Color.FromArgb(14, 165, 233));
+            Color? visualAccent = _isVisualEditorPanelOpen ? Color.FromArgb(245, 158, 11) : null;
+            ApplyButtonStyle(_toggleVisualEditorButton, visualAccent);
             ApplyButtonStyle(linksBtn, Color.FromArgb(99, 102, 241));
             ApplyButtonStyle(ScrapeBtn, Color.FromArgb(16, 185, 129));
             ApplyButtonStyle(btnEvents);
@@ -3237,6 +3487,9 @@ namespace WebView2WindowsFormsBrowser
                 ApplyButtonStyle(_lightThemeButton, lightAccent);
                 _lightThemeButton.Text = _currentTheme == UiTheme.Light ? "Light *" : "Light";
             }
+
+            if (_toggleVisualEditorButton != null)
+                _toggleVisualEditorButton.Text = _isVisualEditorPanelOpen ? "WYSIWYG *" : "WYSIWYG";
         }
 
         private Color GetEditorBaseSyntaxColor()
@@ -3349,12 +3602,11 @@ namespace WebView2WindowsFormsBrowser
                 return;
 
             int available = Math.Max(0, width - _editorSplit.SplitterWidth);
-            int half = available / 2;
-            int minPane = Math.Min(260, half);
+            int desiredDistance = (int)(available * 0.34f);
+            int minPane = Math.Min(260, available / 2);
             if (minPane < 80)
-                minPane = half;
+                minPane = available / 2;
 
-            int desiredDistance = half;
             int minDistance = minPane;
             int maxDistance = Math.Max(minDistance, available - minPane);
             int clampedDistance = Math.Clamp(desiredDistance, minDistance, maxDistance);
@@ -3364,6 +3616,34 @@ namespace WebView2WindowsFormsBrowser
             _editorSplit.SplitterDistance = clampedDistance;
             _editorSplit.Panel1MinSize = minPane;
             _editorSplit.Panel2MinSize = minPane;
+
+            UpdateDesignPreviewSplitLayout();
+        }
+
+        private void UpdateDesignPreviewSplitLayout()
+        {
+            if (_designPreviewSplit == null || _designPreviewSplit.IsDisposed)
+                return;
+
+            int width = _designPreviewSplit.ClientSize.Width;
+            if (width <= 0)
+                return;
+
+            int available = Math.Max(0, width - _designPreviewSplit.SplitterWidth);
+            int minPane = Math.Min(220, available / 2);
+            if (minPane < 80)
+                minPane = available / 2;
+
+            int desiredDistance = available / 2;
+            int minDistance = minPane;
+            int maxDistance = Math.Max(minDistance, available - minPane);
+            int clampedDistance = Math.Clamp(desiredDistance, minDistance, maxDistance);
+
+            _designPreviewSplit.Panel1MinSize = 0;
+            _designPreviewSplit.Panel2MinSize = 0;
+            _designPreviewSplit.SplitterDistance = clampedDistance;
+            _designPreviewSplit.Panel1MinSize = minPane;
+            _designPreviewSplit.Panel2MinSize = minPane;
         }
 
         private void ApplyMenuItemStyle(ToolStripItemCollection items)
