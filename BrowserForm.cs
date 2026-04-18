@@ -42,7 +42,7 @@ namespace WebView2WindowsFormsBrowser
         private Panel _editorSourcePanel;
         private Panel _previewHostPanel;
         private Panel _visualEditorHostPanel;
-        private RichTextBox _htmlEditor;
+        private IndentGuideRichTextBox _htmlEditor;
         private RichTextBox _lineNumberGutter;
         private WebView2 _visualEditorWebView;
         private Button _lightThemeButton;
@@ -3582,7 +3582,7 @@ namespace WebView2WindowsFormsBrowser
                 BackColor = Color.FromArgb(44, 52, 66)
             };
 
-            _htmlEditor = new RichTextBox
+            _htmlEditor = new IndentGuideRichTextBox
             {
                 Dock = DockStyle.Fill,
                 AcceptsTab = true,
@@ -3592,7 +3592,10 @@ namespace WebView2WindowsFormsBrowser
                 Font = new Font("Consolas", 11F, FontStyle.Regular),
                 BackColor = Color.FromArgb(14, 17, 24),
                 ForeColor = EditorBaseColor,
-                ScrollBars = RichTextBoxScrollBars.Both
+                ScrollBars = RichTextBoxScrollBars.Both,
+                ShowIndentGuides = true,
+                IndentSpaces = 2,
+                IndentGuideColor = Color.FromArgb(78, 124, 140, 163)
             };
             _htmlEditor.TextChanged += htmlEditor_TextChanged;
             _htmlEditor.VScroll += htmlEditor_VScroll;
@@ -3867,6 +3870,10 @@ namespace WebView2WindowsFormsBrowser
             {
                 _htmlEditor.BackColor = isDark ? Color.FromArgb(14, 17, 24) : Color.FromArgb(255, 255, 255);
                 _htmlEditor.ForeColor = GetEditorBaseSyntaxColor();
+                _htmlEditor.IndentGuideColor = isDark
+                    ? Color.FromArgb(78, 124, 140, 163)
+                    : Color.FromArgb(88, 148, 163, 184);
+                _htmlEditor.Invalidate();
             }
 
             if (_lineNumberGutter != null)
@@ -4104,6 +4111,284 @@ namespace WebView2WindowsFormsBrowser
                 item.ForeColor = menuStrip1.ForeColor;
                 if (item is ToolStripMenuItem menuItem && menuItem.DropDownItems.Count > 0)
                     ApplyMenuItemStyle(menuItem.DropDownItems);
+            }
+        }
+
+        private sealed class IndentGuideRichTextBox : RichTextBox
+        {
+            private const int WmPaint = 0x000F;
+            private bool _showIndentGuides = true;
+            private int _indentSpaces = 2;
+            private Color _indentGuideColor = Color.FromArgb(78, 124, 140, 163);
+            private string _cachedText = string.Empty;
+            private int[] _cachedLineStarts = Array.Empty<int>();
+            private int[] _cachedIndentLevels = Array.Empty<int>();
+            private int _cachedIndentSize = 2;
+            private int _cachedIndentWidth = -1;
+            private Font _cachedIndentWidthFont;
+
+            public bool ShowIndentGuides
+            {
+                get => _showIndentGuides;
+                set
+                {
+                    if (_showIndentGuides == value)
+                        return;
+
+                    _showIndentGuides = value;
+                    Invalidate();
+                }
+            }
+
+            public int IndentSpaces
+            {
+                get => _indentSpaces;
+                set
+                {
+                    int normalized = Math.Max(1, value);
+                    if (_indentSpaces == normalized)
+                        return;
+
+                    _indentSpaces = normalized;
+                    RebuildIndentCache();
+                    Invalidate();
+                }
+            }
+
+            public Color IndentGuideColor
+            {
+                get => _indentGuideColor;
+                set
+                {
+                    if (_indentGuideColor == value)
+                        return;
+
+                    _indentGuideColor = value;
+                    Invalidate();
+                }
+            }
+
+            protected override void OnTextChanged(EventArgs e)
+            {
+                base.OnTextChanged(e);
+                RebuildIndentCache();
+            }
+
+            protected override void OnFontChanged(EventArgs e)
+            {
+                base.OnFontChanged(e);
+                _cachedIndentWidth = -1;
+                _cachedIndentWidthFont = null;
+                Invalidate();
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                base.WndProc(ref m);
+
+                if (m.Msg == WmPaint && ShowIndentGuides && !IsDisposed && IsHandleCreated && TextLength > 0)
+                    DrawIndentGuides();
+            }
+
+            private void DrawIndentGuides()
+            {
+                EnsureIndentCache();
+                if (_cachedLineStarts.Length == 0 || _cachedIndentLevels.Length == 0)
+                    return;
+
+                int indentSize = Math.Max(1, IndentSpaces);
+                int firstChar = GetCharIndexFromPosition(new Point(1, 1));
+                int lastChar = GetCharIndexFromPosition(new Point(
+                    Math.Max(1, ClientSize.Width - 2),
+                    Math.Max(1, ClientSize.Height - 2)));
+                int firstLine = Math.Max(0, GetLineFromCharIndex(firstChar));
+                int lastLine = Math.Max(firstLine, GetLineFromCharIndex(lastChar) + 1);
+                int maxCachedLine = _cachedIndentLevels.Length - 1;
+                if (firstLine > maxCachedLine)
+                    return;
+
+                lastLine = Math.Min(lastLine, maxCachedLine);
+                int firstLineChar = GetFirstCharIndexFromLine(firstLine);
+                if (firstLineChar < 0)
+                    return;
+
+                Point firstLinePos = GetPositionFromCharIndex(firstLineChar);
+                int lineHeight = GetLineHeight(firstLine, firstLinePos.Y);
+                if (lineHeight <= 0)
+                    lineHeight = Math.Max(1, Font.Height);
+
+                int indentWidth = GetIndentWidth(indentSize);
+                int maxVisibleLevels = Math.Max(1, Math.Min(160, (ClientSize.Width - firstLinePos.X + indentWidth) / Math.Max(1, indentWidth)));
+
+                using var pen = new Pen(IndentGuideColor, 1f);
+                using Graphics graphics = CreateGraphics();
+                graphics.SetClip(ClientRectangle);
+
+                for (int line = firstLine; line <= lastLine; line++)
+                {
+                    int indentLevel = _cachedIndentLevels[line];
+                    if (indentLevel <= 0)
+                        continue;
+
+                    int visibleIndentLevel = Math.Min(indentLevel, maxVisibleLevels);
+                    int yTop = firstLinePos.Y + ((line - firstLine) * lineHeight);
+                    int yBottom = yTop + lineHeight;
+                    if (yBottom < 0)
+                        continue;
+                    if (yTop > ClientSize.Height)
+                        break;
+
+                    for (int level = 1; level <= visibleIndentLevel; level++)
+                    {
+                        int x = firstLinePos.X + (level * indentWidth) - (indentWidth / 2);
+                        if (x < -1 || x > ClientSize.Width)
+                            continue;
+
+                        graphics.DrawLine(pen, x, yTop, x, yBottom);
+                    }
+                }
+            }
+
+            private int GetIndentWidth(int indentSize)
+            {
+                if (_cachedIndentWidth > 0 && _cachedIndentWidthFont == Font && _cachedIndentSize == indentSize)
+                    return _cachedIndentWidth;
+
+                _cachedIndentSize = indentSize;
+                _cachedIndentWidth = Math.Max(2, TextRenderer.MeasureText(
+                    new string(' ', indentSize),
+                    Font,
+                    new Size(int.MaxValue, int.MaxValue),
+                    TextFormatFlags.NoPadding).Width);
+                _cachedIndentWidthFont = Font;
+                return _cachedIndentWidth;
+            }
+
+            private int GetLineHeight(int firstLine, int firstY)
+            {
+                int lineHeight = Math.Max(1, Font.Height);
+                int probeLimit = Math.Min(firstLine + 8, _cachedIndentLevels.Length - 1);
+                for (int probe = firstLine + 1; probe <= probeLimit; probe++)
+                {
+                    int charIndex = GetFirstCharIndexFromLine(probe);
+                    if (charIndex < 0)
+                        continue;
+
+                    int y = GetPositionFromCharIndex(charIndex).Y;
+                    if (y > firstY)
+                        return y - firstY;
+                }
+
+                return lineHeight;
+            }
+
+            private void EnsureIndentCache()
+            {
+                int indentSize = Math.Max(1, IndentSpaces);
+                if (_cachedIndentLevels.Length == 0 || _cachedIndentSize != indentSize || !string.Equals(_cachedText, Text, StringComparison.Ordinal))
+                    RebuildIndentCache();
+            }
+
+            private void RebuildIndentCache()
+            {
+                int indentSize = Math.Max(1, IndentSpaces);
+                string text = Text ?? string.Empty;
+                _cachedText = text;
+                _cachedIndentSize = indentSize;
+                _cachedIndentWidth = -1;
+                _cachedIndentWidthFont = null;
+
+                var lineStarts = new List<int>(Math.Max(1, (text.Length / 40) + 2)) { 0 };
+                for (int i = 0; i < text.Length; i++)
+                {
+                    char ch = text[i];
+                    if (ch == '\r')
+                    {
+                        if (i + 1 < text.Length && text[i + 1] == '\n')
+                            i++;
+
+                        int nextLine = i + 1;
+                        if (nextLine <= text.Length)
+                            lineStarts.Add(nextLine);
+                    }
+                    else if (ch == '\n')
+                    {
+                        int nextLine = i + 1;
+                        if (nextLine <= text.Length)
+                            lineStarts.Add(nextLine);
+                    }
+                }
+
+                if (lineStarts.Count == 0)
+                    lineStarts.Add(0);
+
+                _cachedLineStarts = lineStarts.ToArray();
+                _cachedIndentLevels = new int[_cachedLineStarts.Length];
+
+                int previousLevel = 0;
+                for (int line = 0; line < _cachedLineStarts.Length; line++)
+                {
+                    int lineStart = _cachedLineStarts[line];
+                    int lineEnd = (line + 1 < _cachedLineStarts.Length) ? _cachedLineStarts[line + 1] : text.Length;
+                    int level = GetIndentLevel(text, lineStart, lineEnd, indentSize, out bool isBlankLine);
+                    if (isBlankLine)
+                    {
+                        _cachedIndentLevels[line] = previousLevel;
+                    }
+                    else
+                    {
+                        _cachedIndentLevels[line] = level;
+                        previousLevel = level;
+                    }
+                }
+            }
+
+            private static int GetIndentLevel(string text, int lineStart, int lineEnd, int indentSize, out bool isBlankLine)
+            {
+                int end = Math.Min(text.Length, Math.Max(lineStart, lineEnd));
+                int column = 0;
+                int i = lineStart;
+
+                while (i < end)
+                {
+                    char ch = text[i];
+                    if (ch == '\r' || ch == '\n')
+                    {
+                        break;
+                    }
+
+                    if (ch == ' ')
+                    {
+                        column++;
+                        i++;
+                        continue;
+                    }
+
+                    if (ch == '\t')
+                    {
+                        column += indentSize;
+                        i++;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                isBlankLine = true;
+                for (int j = i; j < end; j++)
+                {
+                    char ch = text[j];
+                    if (ch == '\r' || ch == '\n')
+                        continue;
+
+                    if (!char.IsWhiteSpace(ch))
+                    {
+                        isBlankLine = false;
+                        break;
+                    }
+                }
+
+                return Math.Max(0, column / indentSize);
             }
         }
 
