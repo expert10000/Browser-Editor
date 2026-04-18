@@ -4120,12 +4120,11 @@ namespace WebView2WindowsFormsBrowser
             private bool _showIndentGuides = true;
             private int _indentSpaces = 2;
             private Color _indentGuideColor = Color.FromArgb(78, 124, 140, 163);
-            private string _cachedText = string.Empty;
-            private int[] _cachedLineStarts = Array.Empty<int>();
             private int[] _cachedIndentLevels = Array.Empty<int>();
-            private int _cachedIndentSize = 2;
+            private int _cachedIndentSize = -1;
             private int _cachedIndentWidth = -1;
             private Font _cachedIndentWidthFont;
+            private bool _indentCacheDirty = true;
 
             public bool ShowIndentGuides
             {
@@ -4150,7 +4149,7 @@ namespace WebView2WindowsFormsBrowser
                         return;
 
                     _indentSpaces = normalized;
-                    RebuildIndentCache();
+                    _indentCacheDirty = true;
                     Invalidate();
                 }
             }
@@ -4171,7 +4170,7 @@ namespace WebView2WindowsFormsBrowser
             protected override void OnTextChanged(EventArgs e)
             {
                 base.OnTextChanged(e);
-                RebuildIndentCache();
+                _indentCacheDirty = true;
             }
 
             protected override void OnFontChanged(EventArgs e)
@@ -4193,7 +4192,7 @@ namespace WebView2WindowsFormsBrowser
             private void DrawIndentGuides()
             {
                 EnsureIndentCache();
-                if (_cachedLineStarts.Length == 0 || _cachedIndentLevels.Length == 0)
+                if (_cachedIndentLevels.Length == 0)
                     return;
 
                 int indentSize = Math.Max(1, IndentSpaces);
@@ -4285,7 +4284,7 @@ namespace WebView2WindowsFormsBrowser
             private void EnsureIndentCache()
             {
                 int indentSize = Math.Max(1, IndentSpaces);
-                if (_cachedIndentLevels.Length == 0 || _cachedIndentSize != indentSize || !string.Equals(_cachedText, Text, StringComparison.Ordinal))
+                if (_indentCacheDirty || _cachedIndentLevels.Length == 0 || _cachedIndentSize != indentSize)
                     RebuildIndentCache();
             }
 
@@ -4293,7 +4292,6 @@ namespace WebView2WindowsFormsBrowser
             {
                 int indentSize = Math.Max(1, IndentSpaces);
                 string text = Text ?? string.Empty;
-                _cachedText = text;
                 _cachedIndentSize = indentSize;
                 _cachedIndentWidth = -1;
                 _cachedIndentWidthFont = null;
@@ -4322,14 +4320,14 @@ namespace WebView2WindowsFormsBrowser
                 if (lineStarts.Count == 0)
                     lineStarts.Add(0);
 
-                _cachedLineStarts = lineStarts.ToArray();
-                _cachedIndentLevels = new int[_cachedLineStarts.Length];
+                int[] lineStartArray = lineStarts.ToArray();
+                _cachedIndentLevels = new int[lineStartArray.Length];
 
                 int previousLevel = 0;
-                for (int line = 0; line < _cachedLineStarts.Length; line++)
+                for (int line = 0; line < lineStartArray.Length; line++)
                 {
-                    int lineStart = _cachedLineStarts[line];
-                    int lineEnd = (line + 1 < _cachedLineStarts.Length) ? _cachedLineStarts[line + 1] : text.Length;
+                    int lineStart = lineStartArray[line];
+                    int lineEnd = (line + 1 < lineStartArray.Length) ? lineStartArray[line + 1] : text.Length;
                     int level = GetIndentLevel(text, lineStart, lineEnd, indentSize, out bool isBlankLine);
                     if (isBlankLine)
                     {
@@ -4341,6 +4339,8 @@ namespace WebView2WindowsFormsBrowser
                         previousLevel = level;
                     }
                 }
+
+                _indentCacheDirty = false;
             }
 
             private static int GetIndentLevel(string text, int lineStart, int lineEnd, int indentSize, out bool isBlankLine)
